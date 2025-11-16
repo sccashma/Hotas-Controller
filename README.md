@@ -1,58 +1,105 @@
 # Hotas Controller
 
-Real-time filtering and plotting of Xbox (XInput) controller state with a rolling window, designed to investigate and suppress ghost inputs before forwarding to a virtual Xbox 360 device (planned backend integration e.g. ViGEmBus).
+High‑frequency polling, visualization, and filtering of Xbox (XInput) controller signals. The goal is to detect/suppress ghost inputs (short unintended digital pulses & large analog spikes) and optionally forward a cleaned state to a virtual Xbox 360 device via ViGEm.
 
-> Two code paths still exist (legacy Python prototype + native C++), but the C++/Dear ImGui + ImPlot implementation is the active one and now includes a virtual output toggle (stubbed for future driver integration).
+The active implementation is native C++ using Dear ImGui + ImPlot. A legacy Python prototype exists only for historical reference.
 
-## Features
+## Quick Highlights
+* Adjustable polling rate (clamped 10–8000 Hz) with live effective Hz and loop cost stats.
+* Rolling window plots (configurable seconds) for every signal.
+* Per‑signal enable/disable of filtering (spike & short‑pulse suppression).
+* Gated digital filtering: presses must reach a minimum duration before promotion.
+* Analog spike suppression using absolute delta thresholds.
+* Optional virtual Xbox 360 output when ViGEm client & driver are available.
+* Persistent settings (`filter_settings.cfg`) for filter + runtime parameters.
+* Automatic three‑column dock layout (Control | Raw Signals | Filtered Signals).
 
-- Enumerates connected XInput controllers; pick which one to monitor.
-- <=8 kHz target polling (best-effort, depends on system load).
-- Unified rolling window for all signals.
-- Tabs with grouped signals:
-  - Sticks: Left (X/Y), Right (X/Y)
-  - Triggers / Bumpers: Triggers (analog), Shoulder buttons (digital shown as 0/1)
-  - Buttons / D-Pad: A, B, X, Y, Start, Back, Thumb buttons, D-Pad directions
-- Lightweight architecture.
+## Signal Names
+Enumeration in `src/xinput/xinput_poll.hpp` (used in config keys):
+```
+left_x, left_y, right_x, right_y,
+left_trigger, right_trigger,
+left_shoulder, right_shoulder,
+a, b, x, y, start, back, left_thumb, right_thumb,
+dpad_up, dpad_down, dpad_left, dpad_right
+```
+
+## Filtering Overview
+Digital inputs follow a pending→promoted state machine (see `filtered_forwarder.hpp`). A rising edge starts a timer; only after the press lasts ≥ `digital_max_ms` is it promoted (visible). Releases prior to promotion are fully suppressed.
+
+Analog inputs apply spike suppression per axis: if `|current - previous| >= analog_delta` and filtering for that signal is enabled, the value is clamped to the previous sample. Triggers can be toggled to digital mode individually (UI checkboxes) to join the gated path.
 
 ## Requirements
+* Windows 10/11
+* Visual Studio 2022 (MSVC) or Build Tools + CMake ≥ 3.25
+* DirectX 11 & XInput libraries (provided by VS install)
+* Optional: ViGEmBus driver + client (submodule) for virtual output
 
-- Windows 10/11
-- Visual Studio 2022 (MSVC) or Build Tools with CMake 3.25+
-- No external dependencies besides those fetched automatically (Dear ImGui docking branch & ImPlot) and the Windows / DirectX 11 SDK (bundled with VS install)
+## Build
+Default CMake options (see `CMakeLists.txt`):
+* `BUILD_STATIC` = OFF (set ON to link static MSVC runtime)
+* `WITH_DEMOS`  = OFF (set ON to include ImGui/ImPlot demo windows)
 
-## Build (C++ Version)
-
-```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DWITH_DEMOS=OFF
+Release build:
+```powershell
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release --target hotas_controller
 ```
 
-The resulting binary: `build/Release/hotas_controller.exe`.
+Binary: `build/Release/hotas_controller.exe`
 
-Key CMake options:
-- `BUILD_STATIC` (ON by default): link static MSVC runtime. If you distribute widely and encounter AV or size concerns, you may set this OFF to use the dynamic runtime.
-- `WITH_DEMOS` (ON by default): includes Dear ImGui and ImPlot demo windows. Set OFF for a leaner binary (also slightly reduces heuristic AV triggers).
+MSVC security / hardening flags applied: `/sdl`, `/guard:cf`, `/DYNAMICBASE`, `/NXCOMPAT`.
 
-Security / hardening flags (MSVC): `/sdl /guard:cf /DYNAMICBASE /NXCOMPAT` are applied automatically.
-
-Version metadata is embedded via `res/version.rc`. Adjust values in `res/version.h` before release (company, version, copyright).
-
-## Project Structure (Simplified)
-```
-src/                     # C++ implementation
-  main.cpp               # WinMain + ImGui/ImPlot + docking + UI + virtual output toggle
-  core/ring_buffer.hpp   # Lock-light sample ring buffer
-  xinput/xinput_poll.*   # Polling thread & stats
-  xinput/virtual_output.hpp # Virtual output sink stub
-  ui/plots_panel.*       # Plot grouping & rendering + anomaly detection
-
-res/version.{h,rc}       # Embedded version info (Windows resource)
-CMakeLists.txt           # Build configuration & FetchContent for ImGui/ImPlot
+### Submodules
+Initialize ViGEm client if using virtual output:
+```powershell
+git submodule update --init --recursive
 ```
 
-## Updating Version Info
-Edit `res/version.h` then rebuild. Increment `APP_VERSION_BUILD` for CI/nightly artifacts.
+### Configuration File
+`filter_settings.cfg` (created/saved by explicit **Save Settings** action) contains:
+```
+enabled=0|1
+analog_delta=<float>
+analog_return=<float>
+digital_max_ms=<double>
+target_hz=<double>
+window_seconds=<double>
+virtual_output=0|1
+left_trigger_digital=0|1
+right_trigger_digital=0|1
+filter_<signal_name>=0|1   (per signal)
+```
+No automatic save on exit; use **Save Settings** to persist changes.
+
+## UI Panels
+* **Control**: stats, controller index selection, Hz & window adjustments, filter toggles, per‑signal overrides, save/revert, virtual output toggle (enabled only when backend is `Ready`).
+* **Raw Signals**: direct polled values.
+* **Filtered Signals**: post‑filter state (gating + spike suppression).
+
+## Key Source Files
+* `src/main.cpp` – Win32 & DX11 init, ImGui/ImPlot setup, docking layout, settings I/O.
+* `src/xinput/xinput_poll.*` – polling loop, sample capture, stats.
+* `src/xinput/filtered_forwarder.hpp` – filtering logic + ViGEm forwarding.
+* `src/ui/plots_panel.*` – plot generation & step series creation.
+* `src/core/ring_buffer.hpp` – storage for high‑rate sample history.
+* `external/ViGEmClient/` – ViGEm client library (submodule).
+
+## Performance Notes
+* Very high target rates (> 4 kHz) may be CPU intensive; the loop uses sleep + short spin to hit deadlines.
+* Each signal stores samples in a ring sized at `1<<19` entries to accommodate large windows at high rates.
+
+## Troubleshooting
+| Issue | Suggestions |
+|-------|------------|
+| Virtual output toggle disabled | ViGEmBus driver or client missing; ensure submodule built and driver installed; status should be `Ready`. |
+| High CPU usage | Lower `target_hz`; disable demos; reduce window length. |
+
+## Versioning
+`res/version.h` + `res/version.rc` embed version and manifest (if present) in the binary. Edit before releases.
 
 ## License
-MIT (add a LICENSE file if distributing).
+MIT – see `LICENSE`.
+
+## Disclaimer
+High polling rates and spin waits increase power usage. Choose rates appropriate for diagnostics, not continuous background use.
