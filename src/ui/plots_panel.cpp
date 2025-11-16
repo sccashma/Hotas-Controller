@@ -213,11 +213,11 @@ void PlotsPanel::draw_signals_group_edges(const char* plot_label, const std::vec
 void PlotsPanel::draw() {
     if (ImGui::BeginTabBar("signals_tab")) {
         if (ImGui::BeginTabItem("Sticks")) {
-            draw_signals_group("Left Stick", {
-                {Signal::LeftX, "Left X"}, {Signal::LeftY, "Left Y"}
+            draw_signals_group("Left Stick Axes", {
+                {Signal::LeftX, "Left Stick X Axis"}, {Signal::LeftY, "Left Stick Y Axis"}
             }, -1.05f, 1.05f);
-            draw_signals_group("Right Stick", {
-                {Signal::RightX, "Right X"}, {Signal::RightY, "Right Y"}
+            draw_signals_group("Right Stick Axes", {
+                {Signal::RightX, "Right Stick X Axis"}, {Signal::RightY, "Right Stick Y Axis"}
             }, -1.05f, 1.05f);
             ImGui::EndTabItem();
         }
@@ -231,43 +231,43 @@ void PlotsPanel::draw() {
             if (_left_trigger_digital || _right_trigger_digital) {
                 // Treat any digital triggers as edge-based digital signals (using baseline+edges) combined with any remaining analog one
                 std::vector<std::pair<Signal,const char*>> digitalSeries; digitalSeries.reserve(2);
-                if (_left_trigger_digital) digitalSeries.push_back({Signal::LeftTrigger, "Left (D)"});
-                if (_right_trigger_digital) digitalSeries.push_back({Signal::RightTrigger, "Right (D)"});
+                if (_left_trigger_digital) digitalSeries.push_back({Signal::LeftTrigger, "Left Trigger (LT) Digital"});
+                if (_right_trigger_digital) digitalSeries.push_back({Signal::RightTrigger, "Right Trigger (RT) Digital"});
                 // Plot digital triggers using the same edge-group function (re-using digital short pulse highlighting logic) by borrowing draw_signals_group_edges mechanics.
                 draw_signals_group_edges("Triggers (Digital)", digitalSeries, -0.05f, 1.05f);
                 // If one trigger remains analog, plot it separately (regular analog group call with just that one)
                 std::vector<std::pair<Signal,const char*>> analogRem;
-                if (!_left_trigger_digital) analogRem.push_back({Signal::LeftTrigger, "Left"});
-                if (!_right_trigger_digital) analogRem.push_back({Signal::RightTrigger, "Right"});
+                if (!_left_trigger_digital) analogRem.push_back({Signal::LeftTrigger, "Left Trigger (LT) Analog"});
+                if (!_right_trigger_digital) analogRem.push_back({Signal::RightTrigger, "Right Trigger (RT) Analog"});
                 if (!analogRem.empty()) {
                     draw_signals_group("Triggers (Analog)", analogRem, -0.05f, 1.05f);
                 }
             } else {
-                draw_signals_group("Triggers", { {Signal::LeftTrigger, "Left"}, {Signal::RightTrigger, "Right"} }, -0.05f, 1.05f);
+                draw_signals_group("Triggers (Analog)", { {Signal::LeftTrigger, "Left Trigger (LT)"}, {Signal::RightTrigger, "Right Trigger (RT)"} }, -0.05f, 1.05f);
             }
             // Group digital bumpers (shoulders). Edge-based to catch very short presses.
-            draw_signals_group_edges("Bumpers", {
-                {Signal::LeftShoulder, "Left"}, {Signal::RightShoulder, "Right"}
+            draw_signals_group_edges("Shoulder Buttons (LB/RB)", {
+                {Signal::LeftShoulder, "Left Shoulder (LB)"}, {Signal::RightShoulder, "Right Shoulder (RB)"}
             }, -0.05f, 1.05f);
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Buttons/D-Pad")) {
             // Group ABXY
             // Edge-based plotting for digital groups (ABXY, D-Pad)
-            draw_signals_group_edges("ABXY", {
-                {Signal::A, "A"}, {Signal::B, "B"}, {Signal::X, "X"}, {Signal::Y, "Y"}
+            draw_signals_group_edges("Face Buttons (A/B/X/Y)", {
+                {Signal::A, "Face Button A"}, {Signal::B, "Face Button B"}, {Signal::X, "Face Button X"}, {Signal::Y, "Face Button Y"}
             }, -0.05f, 1.05f);
             // Group Start + Back
-            draw_signals_group_edges("Start/Back", {
-                {Signal::StartBtn, "Start"}, {Signal::BackBtn, "Back"}
+            draw_signals_group_edges("System (Start/Back)", {
+                {Signal::StartBtn, "Start / Menu"}, {Signal::BackBtn, "Back / View"}
             }, -0.05f, 1.05f);
             // Group Thumb buttons
-            draw_signals_group_edges("Thumb Buttons", {
-                {Signal::LeftThumbBtn, "Left Thumb"}, {Signal::RightThumbBtn, "Right Thumb"}
+            draw_signals_group_edges("Thumbstick Buttons (L3/R3)", {
+                {Signal::LeftThumbBtn, "Left Thumbstick Button (L3)"}, {Signal::RightThumbBtn, "Right Thumbstick Button (R3)"}
             }, -0.05f, 1.05f);
             // Group D-Pad
-            draw_signals_group_edges("D-Pad", {
-                {Signal::DPadUp, "Up"}, {Signal::DPadDown, "Down"}, {Signal::DPadLeft, "Left"}, {Signal::DPadRight, "Right"}
+            draw_signals_group_edges("D-Pad (Up/Down/Left/Right)", {
+                {Signal::DPadUp, "D-Pad Up"}, {Signal::DPadDown, "D-Pad Down"}, {Signal::DPadLeft, "D-Pad Left"}, {Signal::DPadRight, "D-Pad Right"}
             }, -0.05f, 1.05f);
             ImGui::EndTabItem();
         }
