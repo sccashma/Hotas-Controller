@@ -27,6 +27,8 @@ struct FilterSettings {
     double digital_max_ms = 5.0; // stored in milliseconds for UI
     bool left_trigger_digital = false; // treat LT as digital for filtering
     bool right_trigger_digital = false; // treat RT as digital for filtering
+    std::array<bool, SignalCount> per_signal_filter;
+    FilterSettings() { per_signal_filter.fill(true); }
 };
 
 // Global persisted runtime parameters
@@ -37,15 +39,32 @@ static bool g_virtual_output_enabled = false; // persisted flag
 static bool LoadFilterSettings(const char* path, FilterSettings& fs) {
     std::ifstream in(path, std::ios::in); if (!in) return false;
     std::string line; std::unordered_map<std::string,std::string> kv; kv.reserve(8);
+    
     while (std::getline(in, line)) {
         if (line.empty() || line[0] == '#') continue;
         auto pos = line.find('='); if (pos==std::string::npos) continue;
         std::string k = line.substr(0,pos); std::string v = line.substr(pos+1);
         kv[k]=v;
     }
-    auto getb=[&](const char* k,bool d)->bool{auto it=kv.find(k); if(it==kv.end()) return d; return it->second=="1"||it->second=="true"||it->second=="TRUE";};
-    auto getf=[&](const char* k,float d)->float{auto it=kv.find(k); if(it==kv.end()) return d; try{ return std::stof(it->second);}catch(...){return d;}};
-    auto getd=[&](const char* k,double d)->double{auto it=kv.find(k); if(it==kv.end()) return d; try{ return std::stod(it->second);}catch(...){return d;}};
+    
+    auto getb = [&](const char* k, bool d) -> bool {
+        auto it = kv.find(k);
+        if (it == kv.end()) return d;
+        return it->second == "1" || it->second == "true" || it->second == "TRUE";
+    };
+    auto getf = [&](const char* k, float d) -> float {
+        auto it = kv.find(k);
+        if (it == kv.end()) return d;
+        try { return std::stof(it->second); }
+        catch (...) { return d; }
+    };
+    auto getd = [&](const char* k, double d) -> double {
+        auto it = kv.find(k);
+        if (it == kv.end()) return d;
+        try { return std::stod(it->second); }
+        catch (...) { return d; }
+    };
+    
     fs.enabled = getb("enabled", fs.enabled);
     fs.analog_delta = getf("analog_delta", fs.analog_delta);
     fs.analog_return = getf("analog_return", fs.analog_return);
@@ -55,6 +74,13 @@ static bool LoadFilterSettings(const char* path, FilterSettings& fs) {
     g_virtual_output_enabled = getb("virtual_output", g_virtual_output_enabled);
     fs.left_trigger_digital = getb("left_trigger_digital", fs.left_trigger_digital);
     fs.right_trigger_digital = getb("right_trigger_digital", fs.right_trigger_digital);
+    fs.right_trigger_digital = getb("right_trigger_digital", fs.right_trigger_digital);
+    
+    // Load per-signal filter overrides
+    for (size_t i=0;i<SIGNAL_META.size();++i) {
+        std::string key = std::string("filter_") + SIGNAL_META[i].name;
+        fs.per_signal_filter[i] = getb(key.c_str(), true);
+    }
     return true;
 }
 
@@ -72,6 +98,10 @@ static void SaveFilterSettings(const char* path, const FilterSettings& fs) {
     out << "virtual_output=" << (g_virtual_output_enabled?1:0) << "\n";
     out << "left_trigger_digital=" << (fs.left_trigger_digital?1:0) << "\n";
     out << "right_trigger_digital=" << (fs.right_trigger_digital?1:0) << "\n";
+    
+    for (size_t i=0;i<SIGNAL_META.size();++i) {
+        out << "filter_" << SIGNAL_META[i].name << "=" << (fs.per_signal_filter[i]?1:0) << "\n";
+    }
 }
 
 #pragma comment(lib, "d3d11.lib")
@@ -190,15 +220,18 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     XInputPoller poller; poller.start(0, g_target_hz, g_window_seconds);
     static FilteredForwarder forwarder;
     poller.set_sink(&forwarder);
-    bool virtual_enabled = g_virtual_output_enabled && std::string(forwarder.backend_status()) == "Ready";
+    bool virtual_enabled = g_virtual_output_enabled &&
+        std::string(forwarder.backend_status()) == "Ready";
     forwarder.enable_output(virtual_enabled);
     forwarder.enable_filter(filter_settings.enabled);
     forwarder.set_params(filter_settings.analog_delta, filter_settings.digital_max_ms/1000.0);
     forwarder.set_trigger_modes(filter_settings.left_trigger_digital, filter_settings.right_trigger_digital);
-    PlotsPanel panel(poller, PlotConfig{g_window_seconds, 4000});
-    panel.set_filter_mode(filter_settings.enabled);
-    panel.set_filter_thresholds(filter_settings.analog_delta, filter_settings.analog_return, filter_settings.digital_max_ms/1000.0);
-    panel.set_trigger_digital(filter_settings.left_trigger_digital, filter_settings.right_trigger_digital);
+    forwarder.set_filter_signals(filter_settings.per_signal_filter);
+    forwarder.set_window_seconds(g_window_seconds);
+    PlotsPanel raw_panel(poller, PlotConfig{g_window_seconds, 4000});
+    raw_panel.set_filter_mode(false);
+    raw_panel.set_filter_thresholds(filter_settings.analog_delta, filter_settings.analog_return, filter_settings.digital_max_ms/1000.0);
+    raw_panel.set_trigger_digital(filter_settings.left_trigger_digital, filter_settings.right_trigger_digital);
     FilterSettings working = filter_settings; // editable working copy
     bool filter_dirty = false;
     // Saved snapshots for runtime parameters to participate in dirty tracking
@@ -249,10 +282,13 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                 ImGui::DockBuilderRemoveNode(dock_id);            // clear any previous (in case of hot reload)
                 ImGui::DockBuilderAddNode(dock_id, ImGuiDockNodeFlags_DockSpace);
                 ImGui::DockBuilderSetNodeSize(dock_id, viewport->Size);
+                // Create a three-column layout: left (Control), middle (Raw Signals), right (Filtered Signals)
                 ImGuiID dock_left = ImGui::DockBuilderSplitNode(dock_id, ImGuiDir_Left, 0.22f, nullptr, &dock_id); // 22% left panel
-                ImGuiID dock_main = dock_id; // remainder
+                ImGuiID dock_right = ImGui::DockBuilderSplitNode(dock_id, ImGuiDir_Right, 0.33f, nullptr, &dock_id); // 33% right panel
+                ImGuiID dock_main = dock_id; // middle area (remaining)
                 ImGui::DockBuilderDockWindow("Control", dock_left);
-                ImGui::DockBuilderDockWindow("Signals", dock_main);
+                ImGui::DockBuilderDockWindow("Raw Signals", dock_main);
+                ImGui::DockBuilderDockWindow("Filtered Signals", dock_right);
                 ImGui::DockBuilderFinish(dock_id);
             }
             ImGui::End();
@@ -313,23 +349,23 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             poller.set_target_hz(g_target_hz);
         }
         // Window length controls (1 - 60 seconds)
-        double win = panel.window_seconds();
+        double win = raw_panel.window_seconds();
         double win_min = 1.0, win_max = 60.0;
         if (ImGui::SliderScalar("Window (s)", ImGuiDataType_Double, &win, &win_min, &win_max, "%.0f")) {
             poller.set_window_seconds(win);
-            panel.set_window_seconds(win);
-            g_window_seconds = win; // live apply
+            raw_panel.set_window_seconds(win);
+            forwarder.set_window_seconds(win);
+            g_window_seconds = win;
         }
         ImGui::SetNextItemWidth(100);
         if (ImGui::InputDouble("Window Exact", &win, 0.1, 1.0, "%.1f")) {
             if (win < 1.0) win = 1.0; else if (win > 60.0) win = 60.0;
             poller.set_window_seconds(win);
-            panel.set_window_seconds(win);
+            raw_panel.set_window_seconds(win);
+            forwarder.set_window_seconds(win);
             g_window_seconds = win;
         }
-        if (ImGui::Button("Clear Plots")) {
-            poller.clear();
-        }
+        if (ImGui::Button("Clear Plots")) { poller.clear(); forwarder.clear_filtered(); }
         // Filter / Anomaly detection controls
         // Filter settings (persistent across runs)
         bool filter_mode = working.enabled;
@@ -338,8 +374,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         double digital_max = working.digital_max_ms;
         if (ImGui::CollapsingHeader("Filter Mode", ImGuiTreeNodeFlags_DefaultOpen)) {
             if (ImGui::Checkbox("Enable Filter Mode", &filter_mode)) {
-                panel.set_filter_mode(filter_mode);
-                working.enabled = filter_mode; filter_dirty = true;
+                raw_panel.set_filter_mode(false);
+                working.enabled = filter_mode;
+                filter_dirty = true;
                 forwarder.enable_filter(filter_mode);
             }
             if (filter_mode) {
@@ -350,28 +387,101 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                 updated |= ImGui::SliderScalar("Digital Pulse Max (ms)", ImGuiDataType_Double, &digital_max, &dp_min, &dp_max, "%.2f");
                 bool lt_dig = working.left_trigger_digital;
                 bool rt_dig = working.right_trigger_digital;
-                if (ImGui::Checkbox("Left Trigger Digital", &lt_dig)) { working.left_trigger_digital = lt_dig; panel.set_trigger_digital(lt_dig, working.right_trigger_digital); forwarder.set_trigger_modes(lt_dig, working.right_trigger_digital); filter_dirty = true; }
-                if (ImGui::Checkbox("Right Trigger Digital", &rt_dig)) { working.right_trigger_digital = rt_dig; panel.set_trigger_digital(working.left_trigger_digital, rt_dig); forwarder.set_trigger_modes(working.left_trigger_digital, rt_dig); filter_dirty = true; }
+                if (ImGui::Checkbox("Left Trigger Digital", &lt_dig)) {
+                    working.left_trigger_digital = lt_dig;
+                    raw_panel.set_trigger_digital(lt_dig, working.right_trigger_digital);
+                    forwarder.set_trigger_modes(lt_dig, working.right_trigger_digital);
+                    filter_dirty = true;
+                }
+                if (ImGui::Checkbox("Right Trigger Digital", &rt_dig)) {
+                    working.right_trigger_digital = rt_dig;
+                    raw_panel.set_trigger_digital(working.left_trigger_digital, rt_dig);
+                    forwarder.set_trigger_modes(working.left_trigger_digital, rt_dig);
+                    filter_dirty = true;
+                }
                 if (updated) {
-                    panel.set_filter_thresholds(analog_delta, analog_return, digital_max/1000.0); // apply live but not yet saved
+                    raw_panel.set_filter_thresholds(analog_delta, analog_return, digital_max/1000.0);
                     working.analog_delta = analog_delta;
                     working.analog_return = analog_return;
                     working.digital_max_ms = digital_max;
                     filter_dirty = true;
                     forwarder.set_params(analog_delta, digital_max/1000.0);
                 }
+                
+                ImGui::SeparatorText("Per-Input Filter Overrides");
+                ImGui::TextDisabled("Unchecked = pass raw input (no spike or pulse filtering).");
+                // Color table (repeatable palette)
+                static ImVec4 cols[] = {
+                    {0.86f,0.58f,0.24f,1},{0.30f,0.75f,0.93f,1},{0.50f,0.70f,0.30f,1},{0.90f,0.30f,0.30f,1},
+                    {0.70f,0.50f,0.90f,1},{0.95f,0.80f,0.30f,1},{0.40f,0.85f,0.60f,1},{0.80f,0.40f,0.80f,1}
+                };
+                auto draw_override = [&](Signal sig, const char* label){
+                    size_t idx = (size_t)sig;
+                    ImGui::PushStyleColor(ImGuiCol_Text, cols[idx % IM_ARRAYSIZE(cols)]);
+                    bool v = working.per_signal_filter[idx];
+                    if (ImGui::Checkbox(label, &v)) {
+                        working.per_signal_filter[idx] = v; filter_dirty = true;
+                        forwarder.set_filter_signals(working.per_signal_filter);
+                    }
+                    ImGui::PopStyleColor();
+                };
+                // Grouped layout - explicitly define columns to avoid collapsing one column when narrow
+                if (ImGui::BeginTable("filter_overrides", 4, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg)) {
+                    ImGui::TableSetupColumn("Col1");
+                    ImGui::TableSetupColumn("Col2");
+                    ImGui::TableSetupColumn("Col3");
+                    ImGui::TableSetupColumn("Col4");
+                    // First row: sticks
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0); draw_override(Signal::LeftX, "Left Stick X");
+                    ImGui::TableSetColumnIndex(1); draw_override(Signal::LeftY, "Left Stick Y");
+                    ImGui::TableSetColumnIndex(2); draw_override(Signal::RightX, "Right Stick X");
+                    ImGui::TableSetColumnIndex(3); draw_override(Signal::RightY, "Right Stick Y");
+                    // Second row: triggers & shoulders
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0); draw_override(Signal::LeftTrigger, "Left Trigger");
+                    ImGui::TableSetColumnIndex(1); draw_override(Signal::RightTrigger, "Right Trigger");
+                    ImGui::TableSetColumnIndex(2); draw_override(Signal::LeftShoulder, "Left Shoulder");
+                    ImGui::TableSetColumnIndex(3); draw_override(Signal::RightShoulder, "Right Shoulder");
+                    // Third row: face buttons
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0); draw_override(Signal::A, "A Button");
+                    ImGui::TableSetColumnIndex(1); draw_override(Signal::B, "B Button");
+                    ImGui::TableSetColumnIndex(2); draw_override(Signal::X, "X Button");
+                    ImGui::TableSetColumnIndex(3); draw_override(Signal::Y, "Y Button");
+                    // Fourth row: system + thumbs
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0); draw_override(Signal::StartBtn, "Start");
+                    ImGui::TableSetColumnIndex(1); draw_override(Signal::BackBtn, "Back");
+                    ImGui::TableSetColumnIndex(2); draw_override(Signal::LeftThumbBtn, "Left Thumb");
+                    ImGui::TableSetColumnIndex(3); draw_override(Signal::RightThumbBtn, "Right Thumb");
+                    // Fifth row: d-pad
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0); draw_override(Signal::DPadUp, "DPad Up");
+                    ImGui::TableSetColumnIndex(1); draw_override(Signal::DPadDown, "DPad Down");
+                    ImGui::TableSetColumnIndex(2); draw_override(Signal::DPadLeft, "DPad Left");
+                    ImGui::TableSetColumnIndex(3); draw_override(Signal::DPadRight, "DPad Right");
+                    ImGui::EndTable();
+                }
+
                 ImGui::TextDisabled("Spikes highlighted in red; short digital pulses flagged.");
                 bool runtime_dirty = (g_target_hz != saved_target_hz) || (g_window_seconds != saved_window_seconds);
                 bool any_dirty = filter_dirty || runtime_dirty;
-                if (any_dirty) { ImGui::SameLine(); ImGui::TextColored(ImVec4(1,0.6f,0,1), "*modified"); }
+
+                if (any_dirty) { 
+                    ImGui::SameLine();
+                    ImGui::SameLine(); ImGui::TextColored(ImVec4(1,0.6f,0,1), "*modified");
+                }
+
                 // Always show buttons; disable when no pending changes (filter or runtime params)
                 ImGui::BeginDisabled(!any_dirty);
                 if (ImGui::Button("Save Settings")) {
                     if (any_dirty) {
                         if (filter_dirty) {
                             filter_settings = working;
+                            forwarder.set_filter_signals(filter_settings.per_signal_filter);
                             forwarder.set_trigger_modes(filter_settings.left_trigger_digital, filter_settings.right_trigger_digital);
-                            panel.set_trigger_digital(filter_settings.left_trigger_digital, filter_settings.right_trigger_digital);
+                            raw_panel.set_trigger_digital(filter_settings.left_trigger_digital, filter_settings.right_trigger_digital);
                         }
                         // Persist current runtime + filter settings
                         SaveFilterSettings("filter_settings.cfg", filter_settings);
@@ -386,17 +496,23 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                     if (any_dirty) {
                         if (filter_dirty) {
                             working = filter_settings;
-                            panel.set_filter_mode(working.enabled);
-                            panel.set_filter_thresholds(working.analog_delta, working.analog_return, working.digital_max_ms/1000.0);
+                            raw_panel.set_filter_mode(false);
+                            raw_panel.set_filter_thresholds(
+                                working.analog_delta,
+                                working.analog_return,
+                                working.digital_max_ms/1000.0);
                             forwarder.enable_filter(working.enabled);
-                            forwarder.set_params(working.analog_delta, working.digital_max_ms/1000.0);
+                            forwarder.set_params(
+                                working.analog_delta,
+                                working.digital_max_ms/1000.0);
                         }
                         if (runtime_dirty) {
                             g_target_hz = saved_target_hz;
                             poller.set_target_hz(g_target_hz);
                             g_window_seconds = saved_window_seconds;
                             poller.set_window_seconds(g_window_seconds);
-                            panel.set_window_seconds(g_window_seconds);
+                            raw_panel.set_window_seconds(g_window_seconds);
+                            forwarder.set_window_seconds(g_window_seconds);
                         }
                         filter_dirty = false;
                     }
@@ -406,9 +522,135 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         }
         ImGui::End();
 
-        // Panels
-        ImGui::Begin("Signals");
-        panel.draw();
+        ImGui::Begin("Raw Signals");
+        raw_panel.draw();
+        ImGui::End();
+
+        ImGui::Begin("Filtered Signals");
+        {
+            auto build_step_series = [](const std::vector<Sample>& in,
+                                        double t0,
+                                        double window_end,
+                                        std::vector<double>& x,
+                                        std::vector<double>& y) {
+                x.clear();
+                y.clear();
+                if (in.empty()) return;
+                float current = in.front().v;
+                double prev_t = in.front().t;
+                if (prev_t < t0) prev_t = t0;
+                x.push_back(prev_t - t0);
+                y.push_back(current);
+                for (size_t i = 1; i < in.size(); ++i) {
+                    const auto &s = in[i];
+                    double tt = s.t;
+                    if (tt < t0) continue;
+                    if (s.v == current) continue;
+                    double rel = tt - t0;
+                    x.push_back(rel);
+                    y.push_back(current);
+                    current = s.v;
+                    x.push_back(rel);
+                    y.push_back(current);
+                }
+                if (!x.empty() && x.back() < window_end) {
+                    x.push_back(window_end);
+                    y.push_back(y.back());
+                }
+            };
+            auto plot_analog_group = [&](const char* label,
+                                         std::initializer_list<std::pair<Signal,const char*>> sigs,
+                                         float y_min,
+                                         float y_max) {
+                double latest = forwarder.latest_filtered_time();
+                double w = forwarder.window_seconds();
+                double t0 = latest - w;
+                struct S { std::vector<double> x; std::vector<double> y; const char* name; };
+                std::vector<S> series;
+                std::vector<Sample> tmp;
+                for (auto &p : sigs) {
+                    forwarder.snapshot_filtered(p.first, tmp);
+                    if (tmp.empty()) continue;
+                    S s; s.name = p.second;
+                    s.x.reserve(tmp.size());
+                    s.y.reserve(tmp.size());
+                    for (auto &sm : tmp) {
+                        if (sm.t >= t0) {
+                            s.x.push_back(sm.t - t0);
+                            s.y.push_back(sm.v);
+                        }
+                    }
+                    if (!s.x.empty()) series.push_back(std::move(s));
+                }
+                if (series.empty()) return;
+                if (ImPlot::BeginPlot(label, ImVec2(-1,150), ImPlotFlags_NoTitle)) {
+                    ImPlot::SetupAxes("Time (s)", "Value",
+                                       ImPlotAxisFlags_NoTickLabels,
+                                       ImPlotAxisFlags_AutoFit);
+                    ImPlot::SetupAxisLimits(ImAxis_X1, 0, w, ImGuiCond_Always);
+                    ImPlot::SetupAxisLimits(ImAxis_Y1, y_min, y_max, ImGuiCond_Always);
+                    for (auto &s : series) {
+                        ImPlot::PlotLine(s.name, s.x.data(), s.y.data(), (int)s.x.size());
+                    }
+                    ImPlot::EndPlot();
+                }
+            };
+            auto plot_digital_group = [&](const char* label,
+                                          std::initializer_list<std::pair<Signal,const char*>> sigs) {
+                double latest = forwarder.latest_filtered_time();
+                double w = forwarder.window_seconds();
+                double t0 = latest - w;
+                struct S { std::vector<double> x; std::vector<double> y; const char* name; };
+                std::vector<S> series;
+                std::vector<Sample> tmp;
+                for (auto &p : sigs) {
+                    forwarder.snapshot_filtered_with_baseline(p.first, tmp);
+                    if (tmp.empty()) continue;
+                    S s; s.name = p.second;
+                    build_step_series(tmp, t0, w, s.x, s.y);
+                    if (!s.x.empty()) series.push_back(std::move(s));
+                }
+                if (series.empty()) return;
+                if (ImPlot::BeginPlot(label, ImVec2(-1,150), ImPlotFlags_NoTitle)) {
+                    ImPlot::SetupAxes("Time (s)", "Value",
+                                       ImPlotAxisFlags_NoTickLabels,
+                                       ImPlotAxisFlags_AutoFit);
+                    ImPlot::SetupAxisLimits(ImAxis_X1, 0, w, ImGuiCond_Always);
+                    ImPlot::SetupAxisLimits(ImAxis_Y1, -0.05f, 1.05f, ImGuiCond_Always);
+                    for (auto &s : series) {
+                        ImPlot::PlotLine(s.name, s.x.data(), s.y.data(), (int)s.x.size());
+                    }
+                    ImPlot::EndPlot();
+                }
+            };
+            plot_analog_group(
+                "Left Stick (Filtered)",
+                { {Signal::LeftX,"Left X"}, {Signal::LeftY,"Left Y"} },
+                -1.05f, 1.05f);
+            plot_analog_group(
+                "Right Stick (Filtered)",
+                { {Signal::RightX,"Right X"}, {Signal::RightY,"Right Y"} },
+                -1.05f, 1.05f);
+            plot_analog_group(
+                "Triggers (Filtered)",
+                { {Signal::LeftTrigger,"Left"}, {Signal::RightTrigger,"Right"} },
+                -0.05f, 1.05f);
+            plot_digital_group(
+                "Shoulders (Filtered)",
+                { {Signal::LeftShoulder,"Left"}, {Signal::RightShoulder,"Right"} });
+            plot_digital_group(
+                "ABXY (Filtered)",
+                { {Signal::A,"A"}, {Signal::B,"B"}, {Signal::X,"X"}, {Signal::Y,"Y"} });
+            plot_digital_group(
+                "Start/Back (Filtered)",
+                { {Signal::StartBtn,"Start"}, {Signal::BackBtn,"Back"} });
+            plot_digital_group(
+                "Thumb (Filtered)",
+                { {Signal::LeftThumbBtn,"Left Thumb"}, {Signal::RightThumbBtn,"Right Thumb"} });
+            plot_digital_group(
+                "D-Pad (Filtered)",
+                { {Signal::DPadUp,"Up"}, {Signal::DPadDown,"Down"}, {Signal::DPadLeft,"Left"}, {Signal::DPadRight,"Right"} });
+        }
         ImGui::End();
 
         // Render plots window
