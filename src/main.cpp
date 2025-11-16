@@ -433,34 +433,34 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                     ImGui::TableSetupColumn("Col4");
                     // First row: sticks
                     ImGui::TableNextRow();
-                    ImGui::TableSetColumnIndex(0); draw_override(Signal::LeftX, "Left Stick X");
-                    ImGui::TableSetColumnIndex(1); draw_override(Signal::LeftY, "Left Stick Y");
-                    ImGui::TableSetColumnIndex(2); draw_override(Signal::RightX, "Right Stick X");
-                    ImGui::TableSetColumnIndex(3); draw_override(Signal::RightY, "Right Stick Y");
+                    ImGui::TableSetColumnIndex(0); draw_override(Signal::LeftX, "Left Stick X Axis");
+                    ImGui::TableSetColumnIndex(1); draw_override(Signal::LeftY, "Left Stick Y Axis");
+                    ImGui::TableSetColumnIndex(2); draw_override(Signal::RightX, "Right Stick X Axis");
+                    ImGui::TableSetColumnIndex(3); draw_override(Signal::RightY, "Right Stick Y Axis");
                     // Second row: triggers & shoulders
                     ImGui::TableNextRow();
-                    ImGui::TableSetColumnIndex(0); draw_override(Signal::LeftTrigger, "Left Trigger");
-                    ImGui::TableSetColumnIndex(1); draw_override(Signal::RightTrigger, "Right Trigger");
-                    ImGui::TableSetColumnIndex(2); draw_override(Signal::LeftShoulder, "Left Shoulder");
-                    ImGui::TableSetColumnIndex(3); draw_override(Signal::RightShoulder, "Right Shoulder");
+                    ImGui::TableSetColumnIndex(0); draw_override(Signal::LeftTrigger, "Left Trigger (LT)");
+                    ImGui::TableSetColumnIndex(1); draw_override(Signal::RightTrigger, "Right Trigger (RT)");
+                    ImGui::TableSetColumnIndex(2); draw_override(Signal::LeftShoulder, "Left Shoulder (LB)");
+                    ImGui::TableSetColumnIndex(3); draw_override(Signal::RightShoulder, "Right Shoulder (RB)");
                     // Third row: face buttons
                     ImGui::TableNextRow();
-                    ImGui::TableSetColumnIndex(0); draw_override(Signal::A, "A Button");
-                    ImGui::TableSetColumnIndex(1); draw_override(Signal::B, "B Button");
-                    ImGui::TableSetColumnIndex(2); draw_override(Signal::X, "X Button");
-                    ImGui::TableSetColumnIndex(3); draw_override(Signal::Y, "Y Button");
+                    ImGui::TableSetColumnIndex(0); draw_override(Signal::A, "Face Button A");
+                    ImGui::TableSetColumnIndex(1); draw_override(Signal::B, "Face Button B");
+                    ImGui::TableSetColumnIndex(2); draw_override(Signal::X, "Face Button X");
+                    ImGui::TableSetColumnIndex(3); draw_override(Signal::Y, "Face Button Y");
                     // Fourth row: system + thumbs
                     ImGui::TableNextRow();
-                    ImGui::TableSetColumnIndex(0); draw_override(Signal::StartBtn, "Start");
-                    ImGui::TableSetColumnIndex(1); draw_override(Signal::BackBtn, "Back");
-                    ImGui::TableSetColumnIndex(2); draw_override(Signal::LeftThumbBtn, "Left Thumb");
-                    ImGui::TableSetColumnIndex(3); draw_override(Signal::RightThumbBtn, "Right Thumb");
+                    ImGui::TableSetColumnIndex(0); draw_override(Signal::StartBtn, "Start / Menu");
+                    ImGui::TableSetColumnIndex(1); draw_override(Signal::BackBtn, "Back / View");
+                    ImGui::TableSetColumnIndex(2); draw_override(Signal::LeftThumbBtn, "Left Thumbstick Button (L3)");
+                    ImGui::TableSetColumnIndex(3); draw_override(Signal::RightThumbBtn, "Right Thumbstick Button (R3)");
                     // Fifth row: d-pad
                     ImGui::TableNextRow();
-                    ImGui::TableSetColumnIndex(0); draw_override(Signal::DPadUp, "DPad Up");
-                    ImGui::TableSetColumnIndex(1); draw_override(Signal::DPadDown, "DPad Down");
-                    ImGui::TableSetColumnIndex(2); draw_override(Signal::DPadLeft, "DPad Left");
-                    ImGui::TableSetColumnIndex(3); draw_override(Signal::DPadRight, "DPad Right");
+                    ImGui::TableSetColumnIndex(0); draw_override(Signal::DPadUp, "D-Pad Up");
+                    ImGui::TableSetColumnIndex(1); draw_override(Signal::DPadDown, "D-Pad Down");
+                    ImGui::TableSetColumnIndex(2); draw_override(Signal::DPadLeft, "D-Pad Left");
+                    ImGui::TableSetColumnIndex(3); draw_override(Signal::DPadRight, "D-Pad Right");
                     ImGui::EndTable();
                 }
 
@@ -624,32 +624,32 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                 }
             };
             plot_analog_group(
-                "Left Stick (Filtered)",
-                { {Signal::LeftX,"Left X"}, {Signal::LeftY,"Left Y"} },
+                "Left Stick",
+                { {Signal::LeftX,"Left Stick X Axis"}, {Signal::LeftY,"Left Stick Y Axis"} },
                 -1.05f, 1.05f);
             plot_analog_group(
-                "Right Stick (Filtered)",
-                { {Signal::RightX,"Right X"}, {Signal::RightY,"Right Y"} },
+                "Right Stick",
+                { {Signal::RightX,"Right Stick X Axis"}, {Signal::RightY,"Right Stick Y Axis"} },
                 -1.05f, 1.05f);
             plot_analog_group(
-                "Triggers (Filtered)",
-                { {Signal::LeftTrigger,"Left"}, {Signal::RightTrigger,"Right"} },
+                "Triggers",
+                { {Signal::LeftTrigger,"Left Trigger (LT)"}, {Signal::RightTrigger,"Right Trigger (RT)"} },
                 -0.05f, 1.05f);
             plot_digital_group(
-                "Shoulders (Filtered)",
-                { {Signal::LeftShoulder,"Left"}, {Signal::RightShoulder,"Right"} });
+                "Shoulder Buttons",
+                { {Signal::LeftShoulder,"Left Shoulder (LB)"}, {Signal::RightShoulder,"Right Shoulder (RB)"} });
             plot_digital_group(
-                "ABXY (Filtered)",
-                { {Signal::A,"A"}, {Signal::B,"B"}, {Signal::X,"X"}, {Signal::Y,"Y"} });
+                "Face Buttons",
+                { {Signal::A,"Face Button A"}, {Signal::B,"Face Button B"}, {Signal::X,"Face Button X"}, {Signal::Y,"Face Button Y"} });
             plot_digital_group(
-                "Start/Back (Filtered)",
-                { {Signal::StartBtn,"Start"}, {Signal::BackBtn,"Back"} });
+                "Start/Back",
+                { {Signal::StartBtn,"Start / Menu"}, {Signal::BackBtn,"Back / View"} });
             plot_digital_group(
-                "Thumb (Filtered)",
-                { {Signal::LeftThumbBtn,"Left Thumb"}, {Signal::RightThumbBtn,"Right Thumb"} });
+                "Thumbstick Buttons",
+                { {Signal::LeftThumbBtn,"Left Thumbstick (L3)"}, {Signal::RightThumbBtn,"Right Thumbstick (R3)"} });
             plot_digital_group(
-                "D-Pad (Filtered)",
-                { {Signal::DPadUp,"Up"}, {Signal::DPadDown,"Down"}, {Signal::DPadLeft,"Left"}, {Signal::DPadRight,"Right"} });
+                "D-Pad",
+                { {Signal::DPadUp,"D-Pad Up"}, {Signal::DPadDown,"D-Pad Down"}, {Signal::DPadLeft,"D-Pad Left"}, {Signal::DPadRight,"D-Pad Right"} });
         }
         ImGui::End();
 
