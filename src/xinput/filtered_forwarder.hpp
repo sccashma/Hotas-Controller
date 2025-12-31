@@ -7,6 +7,17 @@
 #include <array>
 #include <string>
 #include <cstdlib>
+#include <fstream>
+
+// Simple logger for forwarder diagnostics
+static std::mutex _ff_log_mtx;
+static void forwarder_log(const std::string &s) {
+    std::lock_guard<std::mutex> lk(_ff_log_mtx);
+    std::ofstream out("filtered_forwarder.log", std::ios::out | std::ios::app);
+    if (!out) return;
+    out << s;
+    if (s.empty() || s.back() != '\n') out << '\n';
+}
 
 // Applies ghost filtering (short pulse suppression & analog spike suppression)
 // before sending to ViGEm.
@@ -37,7 +48,6 @@ public:
         err = vigem_target_add(_client, _target);
         if (!VIGEM_SUCCESS(err)) { _status = "target add failed"; return; }
         _ready = true; _status = "Ready";
-        for (auto &f : _signal_filter) f.store(true, std::memory_order_relaxed);
     }
     ~FilteredForwarder() override {
         if (_target && _client) {
@@ -51,15 +61,54 @@ public:
         _analog_delta = analog_delta;
         _digital_max = digital_max_sec;
     }
-    void set_filter_signals(const std::array<bool, SignalCount>& arr) {
-        for (size_t i=0;i<SignalCount;++i) _signal_filter[i].store(arr[i], std::memory_order_release);
+    // Set per-signal filter modes: 0=none, 1=digital, 2=analog
+    void set_filter_modes(const std::array<int, SignalCount>& modes) {
+        for (size_t i=0;i<SignalCount;++i) _signal_mode[i].store(modes[i], std::memory_order_release);
     }
     void set_trigger_modes(bool left_digital, bool right_digital) {
         _lt_digital.store(left_digital, std::memory_order_release);
         _rt_digital.store(right_digital, std::memory_order_release);
     }
     void enable_filter(bool e) { _filter_enabled.store(e, std::memory_order_release); }
-    void enable_output(bool e) { if (_ready) _enabled.store(e, std::memory_order_release); else _enabled.store(false, std::memory_order_release); }
+    void enable_output(bool e) {
+        if (e && !_ready) ensure_ready();
+        if (_ready) {
+            if (e) {
+                // Re-plug target to nudge system enumeration
+                VIGEM_ERROR replug_err = VIGEM_ERROR_NONE;
+                if (_client && _target) {
+                    vigem_target_remove(_client, _target);
+                    replug_err = vigem_target_add(_client, _target);
+                }
+                if (!VIGEM_SUCCESS(replug_err)) {
+                    _last_update_status = format_error(replug_err);
+                    forwarder_log(std::string("Replug failed: ") + _last_update_status);
+                }
+            }
+            _enabled.store(e, std::memory_order_release);
+            if (e) {
+                // Perform a one-time neutral update to ensure the virtual device is visible to the system
+                XUSB_REPORT rep{};
+                rep.wButtons = 0;
+                rep.bLeftTrigger = 0;
+                rep.bRightTrigger = 0;
+                rep.sThumbLX = 0;
+                rep.sThumbLY = 0;
+                rep.sThumbRX = 0;
+                rep.sThumbRY = 0;
+                VIGEM_ERROR err = vigem_target_x360_update(_client, _target, rep);
+                if (!VIGEM_SUCCESS(err)) {
+                    _last_update_status = format_error(err);
+                    forwarder_log(std::string("Warm-up update failed: ") + _last_update_status);
+                } else {
+                    if(!_last_update_status.empty()) _last_update_status.clear();
+                    forwarder_log("Warm-up update sent (neutral state)");
+                }
+            }
+        } else {
+            _enabled.store(false, std::memory_order_release);
+        }
+    }
     bool output_enabled() const { return _enabled.load(std::memory_order_acquire); }
     const char* backend_status() const { return _status.c_str(); }
     const char* last_update_status() const { return _last_update_status.c_str(); }
@@ -83,18 +132,15 @@ public:
     }
 
     void process(double t, const XInputPoller::ControllerState& s) override {
-        if (!_ready || !_enabled.load(std::memory_order_acquire)) return;
         XInputPoller::ControllerState cur = s;
         if (_inject_test.exchange(false, std::memory_order_acq_rel)) {
-            // Overwrite with a recognizable pattern
-            cur.lx = -1.0f; cur.ly = 1.0f; // extreme corners
+            cur.lx = -1.0f; cur.ly = 1.0f;
             cur.rx = 1.0f; cur.ry = -1.0f;
             cur.lt = 1.0f; cur.rt = 1.0f;
-            // Set A+B+X+Y and shoulders
             cur.buttons |= (XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B | XINPUT_GAMEPAD_X | XINPUT_GAMEPAD_Y |
                             XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_RIGHT_SHOULDER);
         }
-        // If trigger digital mode active, threshold first so analog spike clamp doesn't treat binary edge as spike.
+
         bool ltDig = _lt_digital.load(std::memory_order_acquire);
         bool rtDig = _rt_digital.load(std::memory_order_acquire);
         if (ltDig) cur.lt = cur.lt >= 0.5f ? 1.0f : 0.0f;
@@ -102,6 +148,7 @@ public:
         if (_filter_enabled.load(std::memory_order_acquire)) {
             apply_filter(t, cur, ltDig, rtDig);
         }
+
         {
             _filtered_rings[(size_t)Signal::LeftX].push(t, cur.lx);
             _filtered_rings[(size_t)Signal::LeftY].push(t, cur.ly);
@@ -109,9 +156,7 @@ public:
             _filtered_rings[(size_t)Signal::RightY].push(t, cur.ry);
             _filtered_rings[(size_t)Signal::LeftTrigger].push(t, cur.lt);
             _filtered_rings[(size_t)Signal::RightTrigger].push(t, cur.rt);
-            auto push_btn = [&](Signal sig, uint16_t mask) {
-                _filtered_rings[(size_t)sig].push(t, (cur.buttons & mask) ? 1.0f : 0.0f);
-            };
+            auto push_btn = [&](Signal sig, uint16_t mask) { _filtered_rings[(size_t)sig].push(t, (cur.buttons & mask) ? 1.0f : 0.0f); };
             push_btn(Signal::LeftShoulder, XINPUT_GAMEPAD_LEFT_SHOULDER);
             push_btn(Signal::RightShoulder, XINPUT_GAMEPAD_RIGHT_SHOULDER);
             push_btn(Signal::A, XINPUT_GAMEPAD_A);
@@ -127,7 +172,10 @@ public:
             push_btn(Signal::DPadLeft, XINPUT_GAMEPAD_DPAD_LEFT);
             push_btn(Signal::DPadRight, XINPUT_GAMEPAD_DPAD_RIGHT);
             _latest_time_filtered.store(t, std::memory_order_release);
+            static double _last_logged = 0.0;
+            if (t - _last_logged >= 0.050) { _last_logged = t; forwarder_log(std::string("FilteredForwarder: latest_time=") + std::to_string(t)); }
         }
+
         auto to_short = [](float v){ if (v>1) v=1; if (v<-1) v=-1; return (int16_t)(v>=0? v*32767.0f : v*32768.0f); };
         auto to_trig = [](float v){ if (v<0) v=0; if (v>1) v=1; return (uint8_t)(v*255.0f + 0.5f); };
         XUSB_REPORT rep{};
@@ -138,14 +186,27 @@ public:
         rep.sThumbLY = to_short(-cur.ly);
         rep.sThumbRX = to_short(cur.rx);
         rep.sThumbRY = to_short(-cur.ry);
-        auto err = vigem_target_x360_update(_client, _target, rep);
-        if (!VIGEM_SUCCESS(err)) {
-            _last_update_status = format_error(err);
-        } else if(!_last_update_status.empty()) {
-            _last_update_status.clear();
+        if (_enabled.load(std::memory_order_acquire)) {
+            VIGEM_ERROR err = vigem_target_x360_update(_client, _target, rep);
+            if (!VIGEM_SUCCESS(err)) { _last_update_status = format_error(err); }
+            else if(!_last_update_status.empty()) { _last_update_status.clear(); }
+        } else {
+            if (!_last_update_status.empty()) _last_update_status.clear();
         }
     }
 private:
+    void ensure_ready() {
+        if (_ready) return;
+        _client = vigem_alloc();
+        if (!_client) { _status = "alloc failed"; return; }
+        VIGEM_ERROR err = vigem_connect(_client);
+        if (!VIGEM_SUCCESS(err)) { _status = "connect failed"; return; }
+        _target = vigem_target_x360_alloc();
+        if (!_target) { _status = "target alloc failed"; return; }
+        err = vigem_target_add(_client, _target);
+        if (!VIGEM_SUCCESS(err)) { _status = "target add failed"; return; }
+        _ready = true; _status = "Ready";
+    }
     static std::string format_error(VIGEM_ERROR err) {
         if (err == VIGEM_ERROR_NONE) return std::string();
         switch (err) {
@@ -173,74 +234,105 @@ private:
     }
     void apply_filter(double t, XInputPoller::ControllerState& cs, bool ltDig, bool rtDig) {
         std::lock_guard<std::mutex> lk(_mtx);
-        // Analog spike suppression (skip if signal filtering disabled)
-        if (_have_prev) {
-            auto clamp_delta = [&](float &cur, float prev, Signal sig){
-                if (!_signal_filter[(size_t)sig].load(std::memory_order_acquire)) return;
-                float dv = fabsf(cur - prev); if (dv >= _analog_delta) cur = prev;
-            };
-            clamp_delta(cs.lx, _prev.lx, Signal::LeftX);
-            clamp_delta(cs.ly, _prev.ly, Signal::LeftY);
-            clamp_delta(cs.rx, _prev.rx, Signal::RightX);
-            clamp_delta(cs.ry, _prev.ry, Signal::RightY);
-            if (!ltDig) clamp_delta(cs.lt, _prev.lt, Signal::LeftTrigger);
-            if (!rtDig) clamp_delta(cs.rt, _prev.rt, Signal::RightTrigger);
+        if (!_have_prev) {
+            _prev = cs;
+            _have_prev = true;
+            return;
         }
-        // Build unified button array (include digital triggers mapped to high indices 14/15)
+        
+        // Apply per-signal analog or digital filtering based on mode
+        auto apply_analog_filter = [&](float &cur, float prev, Signal sig) {
+            float dv = fabsf(cur - prev);
+            if (dv >= _analog_delta) cur = prev; // spike detected; revert to prev
+        };
+        
+        auto apply_digital_filter = [&](bool &now, bool prev, int btn_idx, Signal sig) {
+            double &rise = _rise_time[btn_idx];
+            bool &active = _btn_active[btn_idx];
+            if (now && !prev) {
+                rise = t; active = false; // rising edge detected, not yet promoted
+            } else if (now && prev) {
+                if (!active && rise >= 0.0) {
+                    double dur = t - rise;
+                    if (dur >= _digital_max) active = true; // promoted after duration
+                }
+            } else if (!now && prev) {
+                active = false; rise = -1.0; // release
+            } else {
+                rise = -1.0; active = false; // stable low
+            }
+            _btn_prev_raw[btn_idx] = now;
+        };
+        
+        // Process analog signals (stick axes, triggers in analog mode)
+        {
+            int mode_lx = _signal_mode[(size_t)Signal::LeftX].load(std::memory_order_acquire);
+            int mode_ly = _signal_mode[(size_t)Signal::LeftY].load(std::memory_order_acquire);
+            int mode_rx = _signal_mode[(size_t)Signal::RightX].load(std::memory_order_acquire);
+            int mode_ry = _signal_mode[(size_t)Signal::RightY].load(std::memory_order_acquire);
+            if (mode_lx == 2) apply_analog_filter(cs.lx, _prev.lx, Signal::LeftX);
+            if (mode_ly == 2) apply_analog_filter(cs.ly, _prev.ly, Signal::LeftY);
+            if (mode_rx == 2) apply_analog_filter(cs.rx, _prev.rx, Signal::RightX);
+            if (mode_ry == 2) apply_analog_filter(cs.ry, _prev.ry, Signal::RightY);
+            
+            // Triggers: apply analog filter only if not in digital mode
+            if (!ltDig) {
+                int mode_lt = _signal_mode[(size_t)Signal::LeftTrigger].load(std::memory_order_acquire);
+                if (mode_lt == 2) apply_analog_filter(cs.lt, _prev.lt, Signal::LeftTrigger);
+            }
+            if (!rtDig) {
+                int mode_rt = _signal_mode[(size_t)Signal::RightTrigger].load(std::memory_order_acquire);
+                if (mode_rt == 2) apply_analog_filter(cs.rt, _prev.rt, Signal::RightTrigger);
+            }
+        }
+        
+        // Process digital signals (buttons, digital triggers)
         constexpr int BTN_COUNT = 16;
         bool btn_now[BTN_COUNT] = {false};
         for (int bit=0; bit<BTN_COUNT; ++bit) btn_now[bit] = (cs.buttons & (1u<<bit)) != 0;
-        // Use reserved/unused bits 10/11 for digital trigger virtual mapping
+        
+        // Map digital triggers to virtual indices
         const int LT_INDEX = 10; const int RT_INDEX = 11;
         if (ltDig) btn_now[LT_INDEX] = cs.lt > 0.5f;
         if (rtDig) btn_now[RT_INDEX] = cs.rt > 0.5f;
-        // Map indices to Signal (best-effort; unused indices map to COUNT)
+        
+        // Index to Signal mapping
         static const Signal INDEX_TO_SIGNAL[BTN_COUNT] = {
             Signal::DPadUp, Signal::DPadDown, Signal::DPadLeft, Signal::DPadRight,
             Signal::StartBtn, Signal::BackBtn, Signal::LeftThumbBtn, Signal::RightThumbBtn,
             Signal::LeftShoulder, Signal::RightShoulder, Signal::COUNT, Signal::COUNT,
-            Signal::A, Signal::B, Signal::X, Signal::Y // preserve X/Y at 14/15
+            Signal::A, Signal::B, Signal::X, Signal::Y
         };
-        // GATED LOGIC (skip entirely if filtering disabled for that signal)
-        for (int i=0;i<BTN_COUNT;++i) {
-            bool now = btn_now[i]; bool prev = _btn_prev_raw[i];
-            double &rise = _rise_time[i]; bool &active = _btn_active[i];
+        
+        // Process each button with its filter mode
+        for (int i=0; i<BTN_COUNT; ++i) {
             Signal sig = INDEX_TO_SIGNAL[i];
-            bool filtering_enabled = (sig != Signal::COUNT) ? _signal_filter[(size_t)sig].load(std::memory_order_acquire) : true;
-            if (!filtering_enabled) {
-                // Bypass gating: immediate visibility
-                active = now;
-                rise = -1.0;
+            int mode = (sig != Signal::COUNT) ? _signal_mode[(size_t)sig].load(std::memory_order_acquire) : 0;
+            bool now = btn_now[i];
+            bool prev = _btn_prev_raw[i];
+            
+            if (mode == 0) {
+                // None: pass raw (immediate)
+                _btn_active[i] = now;
                 _btn_prev_raw[i] = now;
-                continue;
+            } else if (mode == 1) {
+                // Digital: gated debounce
+                apply_digital_filter(now, prev, i, sig);
             }
-            // Original gated behavior
-            if (now && !prev) {
-                rise = t; active = false;
-            } else if (now && prev) {
-                if (!active && rise > 0.0) {
-                    double dur = t - rise;
-                    if (dur >= _digital_max) active = true;
-                }
-            } else if (!now && prev) {
-                // release
-                active = false;
-                rise = -1.0;
-            } else {
-                rise = -1.0; if (active) active = false;
-            }
-            _btn_prev_raw[i] = now;
+            // Mode 2 (analog) not applicable to digital signals; ignore
         }
-        // Compose output mask (exclude digital trigger indices 14/15)
+        
+        // Compose output button mask
         uint16_t outMask = 0;
-        for (int i=0;i<BTN_COUNT;++i) {
-            if (i==LT_INDEX || i==RT_INDEX) continue;
+        for (int i=0; i<BTN_COUNT; ++i) {
+            if (i == LT_INDEX || i == RT_INDEX) continue; // skip virtual indices
             if (_btn_active[i]) outMask |= (1u<<i);
         }
         cs.buttons = outMask;
         if (ltDig) cs.lt = _btn_active[LT_INDEX] ? 1.0f : 0.0f;
         if (rtDig) cs.rt = _btn_active[RT_INDEX] ? 1.0f : 0.0f;
-        _prev = cs; _have_prev = true;
+        
+        _prev = cs;
     }
 
     std::atomic<bool> _filter_enabled{false};
@@ -260,7 +352,8 @@ private:
     std::atomic<bool> _inject_test{false};
     std::atomic<bool> _lt_digital{false};
     std::atomic<bool> _rt_digital{false};
-    std::array<std::atomic<bool>, SignalCount> _signal_filter{};
+    // Per-signal filter mode: 0=none, 1=digital, 2=analog
+    std::array<std::atomic<int>, SignalCount> _signal_mode{};
     std::atomic<double> _window_seconds{30.0};
     std::atomic<double> _latest_time_filtered{0.0};
     std::array<SampleRing, SignalCount> _filtered_rings;

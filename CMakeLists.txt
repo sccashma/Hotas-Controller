@@ -6,7 +6,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(BUILD_STATIC "Build static executable" OFF)
-option(WITH_DEMOS "Include Dear ImGui & ImPlot demo windows" OFF)
 
 if(MSVC)
     add_definitions(-D_CRT_SECURE_NO_WARNINGS)
@@ -37,6 +36,17 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(imgui implot)
 
+# Fetch nlohmann/json for JSON profile persistence
+FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG v3.11.2
+)
+## Avoid running the external library's CMake which may require an older
+## CMake policy. Populate only and use its include dir.
+FetchContent_Populate(nlohmann_json)
+set(nlohmann_json_SOURCE_DIR "${nlohmann_json_SOURCE_DIR}")
+
 # ImGui sources (core + backends for Win32 + DX11)
 set(IMGUI_SRC
     ${imgui_SOURCE_DIR}/imgui.cpp
@@ -48,17 +58,10 @@ set(IMGUI_SRC
     ${imgui_SOURCE_DIR}/misc/cpp/imgui_stdlib.cpp
 )
 
-if (WITH_DEMOS)
-    list(APPEND IMGUI_SRC ${imgui_SOURCE_DIR}/imgui_demo.cpp)
-endif()
-
 set(IMPLOT_SRC
     ${implot_SOURCE_DIR}/implot.cpp
     ${implot_SOURCE_DIR}/implot_items.cpp
 )
-if (WITH_DEMOS)
-    list(APPEND IMPLOT_SRC ${implot_SOURCE_DIR}/implot_demo.cpp)
-endif()
 
 add_library(imgui_lib STATIC ${IMGUI_SRC} ${IMPLOT_SRC})
 target_include_directories(imgui_lib PUBLIC ${imgui_SOURCE_DIR} ${implot_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
@@ -68,6 +71,10 @@ set(APP_SOURCES
     src/core/ring_buffer.hpp
     src/xinput/xinput_poll.cpp
     src/xinput/xinput_poll.hpp
+    src/xinput/hotas_reader.cpp
+    src/xinput/hotas_reader.hpp
+    src/xinput/hotas_mapper.cpp
+    src/xinput/hotas_mapper.hpp
     src/xinput/filtered_forwarder.hpp
     src/ui/plots_panel.cpp
     src/ui/plots_panel.hpp
@@ -106,11 +113,9 @@ target_link_libraries(${PROJECT_NAME} PRIVATE imgui_lib d3d11 dxgi ViGEmClient s
 target_include_directories(${PROJECT_NAME} PRIVATE external/ViGEmClient/include)
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE IMGUI_ENABLE_DOCKING)
-if (WITH_DEMOS)
-    target_compile_definitions(${PROJECT_NAME} PRIVATE WITH_DEMOS)
-endif()
 
 target_include_directories(${PROJECT_NAME} PRIVATE src)
+target_include_directories(${PROJECT_NAME} PRIVATE ${nlohmann_json_SOURCE_DIR}/include)
 
 # Enable higher optimization for release
 if(NOT CMAKE_BUILD_TYPE)

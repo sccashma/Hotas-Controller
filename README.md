@@ -103,3 +103,39 @@ MIT – see `LICENSE`.
 
 ## Disclaimer
 High polling rates and spin waits increase power usage. Choose rates appropriate for diagnostics, not continuous background use.
+
+## Mappings (HOTAS → Action)
+
+Configure how HOTAS signals map to output actions via the UI or by editing the JSON profile.
+
+Quick steps (UI)
+- Open Edit → Mappings in the app (see UI in [`src/main.cpp`](src/main.cpp)).
+- Device: choose All / Stick / Throttle.
+- Signal: populated from the runtime HOTAS signal list (`[`HotasReader::list_signals`](src/xinput/hotas_reader.cpp)` / [`src/xinput/hotas_reader.hpp`](src/xinput/hotas_reader.hpp)`).
+- Action Type: select one of:
+  - x360 — maps to a virtual Xbox 360 input (labels defined in [`src/main.cpp`](src/main.cpp))
+  - keyboard — sends key (e.g. "VK_SPACE" or 'A')
+  - mouse — sends mouse actions (e.g. left_click)
+- Click "Add Mapping" to create the mapping; use Save/Load to persist via the UI (calls [`HotasMapper::save_profile`](src/xinput/hotas_mapper.cpp) / [`HotasMapper::load_profile`](src/xinput/hotas_mapper.cpp)).
+
+Mapping internals
+- A mapping is represented by [`MappingEntry`](src/xinput/hotas_mapper.hpp) and stored/loaded as JSON in `mappings.json` (example in [`mappings.json`](mappings.json)).
+- New logical samples are fed into the mapper via [`HotasMapper::accept_sample`](src/xinput/hotas_mapper.cpp) (called from the HOTAS raw parser / UI code).
+- The mapper publishes mapped X360 reports at its publish rate and uses ViGEm to emit a virtual controller (see [`src/xinput/hotas_mapper.cpp`](src/xinput/hotas_mapper.cpp) and the ViGEm client submodule at [`external/ViGEmClient`](external/ViGEmClient)).
+
+Injection flow (high level)
+- HOTAS raw reports → parsed by [`HotasReader::get_hid_live_snapshot` / `list_signals`](src/xinput/hotas_reader.cpp) → logical values passed to [`HotasMapper::accept_sample`](src/xinput/hotas_mapper.cpp) → mapper publishes to virtual device (ViGEm) in [`HotasMapper::publisher_thread_main`](src/xinput/hotas_mapper.cpp).
+- The UI wires mapper injection into the app poller via [`HotasMapper::set_inject_callback`](src/xinput/hotas_mapper.cpp) / the call in [`src/main.cpp`](src/main.cpp) which injects mapped states into the `XInputPoller` for filtering/forwarding.
+
+File references
+- UI wiring / Mappings dialog: [`src/main.cpp`](src/main.cpp)
+- Mapper interface & MappingEntry: [`src/xinput/hotas_mapper.hpp`](src/xinput/hotas_mapper.hpp)
+- Mapper implementation (save/load/publish): [`src/xinput/hotas_mapper.cpp`](src/xinput/hotas_mapper.cpp)
+- HOTAS signal discovery & HID live: [`src/xinput/hotas_reader.hpp`](src/xinput/hotas_reader.hpp) / [`src/xinput/hotas_reader.cpp`](src/xinput/hotas_reader.cpp)
+- Example mapping profile: [`mappings.json`](mappings.json)
+- Virtual output (ViGEm) client code: [`external/ViGEmClient`](external/ViGEmClient)
+
+Notes & tips
+- Use the device filter to reduce the signal list to Stick or Throttle when authoring mappings.
+- After editing `mappings.json` manually, use Load in the Mappings UI to apply.
+- If ViGEm is not Ready the x360 action targets will not be emitted; check ViGEm status in the Control panel (see [`src/xinput/hotas_mapper.cpp`](src/xinput/hotas_mapper.cpp) and [`external/ViGEmClient`](external/ViGEmClient)).
