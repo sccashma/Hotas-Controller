@@ -12,7 +12,9 @@
 #include <implot.h>
 #include <imgui_internal.h>
 #include <mmsystem.h>
+#include <wincodec.h>
 #pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "Windowscodecs.lib")
 #include "xinput/xinput_poll.hpp"
 #include "ui/plots_panel.hpp"
 #include <fstream>
@@ -125,6 +127,50 @@ static ID3D11Device*            g_pd3dDevice = nullptr;
 static ID3D11DeviceContext*     g_pd3dDeviceContext = nullptr;
 static IDXGISwapChain*          g_pSwapChain = nullptr;
 static ID3D11RenderTargetView*  g_mainRenderTargetView = nullptr;
+static ID3D11ShaderResourceView* g_backgroundSRV = nullptr;
+static int g_bg_width = 0, g_bg_height = 0;
+
+static bool LoadTextureWIC(const wchar_t* filename, ID3D11Device* device, ID3D11DeviceContext* context,
+                           ID3D11ShaderResourceView** out_srv, int* out_width, int* out_height) {
+    if (!device || !context || !filename || !out_srv) return false;
+    *out_srv = nullptr;
+    HRESULT hr;
+    IWICImagingFactory* factory = nullptr;
+    hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
+    if (FAILED(hr) || !factory) return false;
+    IWICBitmapDecoder* decoder = nullptr;
+    hr = factory->CreateDecoderFromFilename(filename, nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &decoder);
+    if (FAILED(hr) || !decoder) { factory->Release(); return false; }
+    IWICBitmapFrameDecode* frame = nullptr;
+    hr = decoder->GetFrame(0, &frame);
+    if (FAILED(hr) || !frame) { decoder->Release(); factory->Release(); return false; }
+    UINT w=0,h=0; frame->GetSize(&w,&h);
+    IWICFormatConverter* converter = nullptr;
+    hr = factory->CreateFormatConverter(&converter);
+    if (FAILED(hr) || !converter) { frame->Release(); decoder->Release(); factory->Release(); return false; }
+    hr = converter->Initialize(frame, GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom);
+    if (FAILED(hr)) { converter->Release(); frame->Release(); decoder->Release(); factory->Release(); return false; }
+    std::vector<uint8_t> pixels; pixels.resize((size_t)w * (size_t)h * 4);
+    hr = converter->CopyPixels(nullptr, w * 4, (UINT)pixels.size(), pixels.data());
+    if (FAILED(hr)) { converter->Release(); frame->Release(); decoder->Release(); factory->Release(); return false; }
+    converter->Release(); frame->Release(); decoder->Release(); factory->Release();
+
+    D3D11_TEXTURE2D_DESC texDesc{};
+    texDesc.Width = w; texDesc.Height = h; texDesc.MipLevels = 1; texDesc.ArraySize = 1;
+    texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; texDesc.SampleDesc.Count = 1;
+    texDesc.Usage = D3D11_USAGE_IMMUTABLE; texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA initData{}; initData.pSysMem = pixels.data(); initData.SysMemPitch = w * 4;
+    ID3D11Texture2D* tex = nullptr;
+    hr = device->CreateTexture2D(&texDesc, &initData, &tex);
+    if (FAILED(hr) || !tex) return false;
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+    srvDesc.Format = texDesc.Format; srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; srvDesc.Texture2D.MipLevels = 1;
+    hr = device->CreateShaderResourceView(tex, &srvDesc, out_srv);
+    tex->Release();
+    if (FAILED(hr) || !*out_srv) return false;
+    if (out_width) *out_width = (int)w; if (out_height) *out_height = (int)h;
+    return true;
+}
 
 static void CreateRenderTarget() {
     ID3D11Texture2D* pBackBuffer;
@@ -186,6 +232,7 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     // Increase timer resolution for better sub-millisecond sleep precision
     timeBeginPeriod(1);
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     // Register class
     WNDCLASSEX wc{ sizeof(WNDCLASSEX), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, _T("XInputPlotter"), nullptr };
     RegisterClassEx(&wc);
@@ -220,6 +267,16 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
+
+    // Load background image (try common relative paths)
+    const wchar_t* candidates[] = {
+        L"res\\graphics\\HOTAS_Controller.png",
+        L"..\\res\\graphics\\HOTAS_Controller.png",
+        L"..\\..\\res\\graphics\\HOTAS_Controller.png"
+    };
+    for (auto* path : candidates) {
+        if (LoadTextureWIC(path, g_pd3dDevice, g_pd3dDeviceContext, &g_backgroundSRV, &g_bg_width, &g_bg_height)) break;
+    }
 
     // Load persisted settings before starting poller (overrides defaults if present)
     FilterSettings filter_settings; LoadFilterSettings("filter_settings.cfg", filter_settings);
@@ -266,11 +323,15 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     std::atomic<bool> output_auto_started{false};
     std::thread hotas_background_thread([&]() {
         using clock = std::chrono::steady_clock;
+        auto last_ok_tp = clock::now();
+        auto next_refresh_tp = clock::now();
         while (hotas_bg_thread_running.load()) {
             // HOTAS input always enabled
             if (hotas_bg_enabled.load()) {
                 auto snap = hotas.poll_once();
+                auto now_tp = clock::now();
                 if (snap.ok) {
+                    last_ok_tp = now_tp;
                     if (!hotas_detected.exchange(true)) {
                         // First detection; auto-start virtual output
                         if (!forwarder.output_enabled()) {
@@ -278,9 +339,17 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                         }
                         output_auto_started.store(true, std::memory_order_release);
                     }
-                    double now = std::chrono::duration<double>(clock::now().time_since_epoch()).count();
+                    double now = std::chrono::duration<double>(now_tp.time_since_epoch()).count();
                     // Inject the raw HOTAS state into the poller pipeline (poller -> filter -> mapper -> output)
                     poller.inject_state(now, snap.state);
+                } else {
+                    // If we've had no valid HOTAS data for >1s, refresh HID live to re-enumerate devices
+                    if (now_tp - last_ok_tp > std::chrono::seconds(1) && now_tp >= next_refresh_tp) {
+                        hotas.stop_hid_live();
+                        hotas.start_hid_live();
+                        next_refresh_tp = now_tp + std::chrono::seconds(2); // cooldown to avoid busy re-enumeration
+                        hotas_detected.store(false, std::memory_order_release);
+                    }
                 }
             }
             // Poll HOTAS at ~250Hz even when disabled (fast wakeup when enabled)
@@ -315,6 +384,27 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
+
+        // Draw background image to viewport
+        {
+            const ImGuiViewport* vp = ImGui::GetMainViewport();
+            if (g_backgroundSRV && vp) {
+                ImDrawList* dl = ImGui::GetBackgroundDrawList();
+                ImVec2 pos = vp->Pos;
+                ImVec2 size = vp->Size;
+                dl->AddImage((void*)g_backgroundSRV, pos, ImVec2(pos.x + size.x, pos.y + size.y));
+            }
+        }
+
+        // Make panes/docks transparent
+        {
+            ImGuiStyle& style = ImGui::GetStyle();
+            style.Colors[ImGuiCol_WindowBg].w = 0.0f;
+            style.Colors[ImGuiCol_ChildBg].w = 0.0f;
+            style.Colors[ImGuiCol_MenuBarBg].w = 0.2f;
+            style.Colors[ImGuiCol_TitleBg].w = 0.3f;
+            style.Colors[ImGuiCol_TitleBgActive].w = 0.4f;
+        }
 
         // Dockspace window + initial layout (Control left, Signals main) on first frame
         {
@@ -393,7 +483,7 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         }
 
         // Control window
-        ImGui::Begin("Control");
+        ImGui::Begin("Control", nullptr, ImGuiWindowFlags_NoBackground);
         auto stats = poller.stats();
         ImGui::Text("Effective Hz: %.1f", stats.effective_hz);
         // Sync UI checkbox with backend state
@@ -630,7 +720,7 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
         // HOTAS detection window (Help -> Detect Inputs...)
         if (show_hotas_detect_window) {
-            ImGui::Begin("Detect HOTAS Devices", &show_hotas_detect_window);
+            ImGui::Begin("Detect HOTAS Devices", &show_hotas_detect_window, ImGuiWindowFlags_NoBackground);
             ImGui::TextWrapped("This lists DirectInput game controller devices. Use Refresh to rescan. Click Save to write results to hotas_devices.txt.");
             if (ImGui::Button("Refresh")) {
                 hotas_detect_lines = HotasReader::enumerate_devices();
@@ -807,12 +897,12 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             ImGui::End();
         }
 
-        ImGui::Begin("Raw Signals");
+        ImGui::Begin("Raw Signals", nullptr, ImGuiWindowFlags_NoBackground);
         raw_panel.draw();
         ImGui::End();
 
         // HOTAS Raw window: parse HID live hex and show raw integer graphs for mapped inputs
-        ImGui::Begin("HOTAS Raw");
+        ImGui::Begin("HOTAS Raw", nullptr, ImGuiWindowFlags_NoBackground);
         // Mapping from CSV: device stick (Saitek X56)
         struct HidInputMap { const char* id; const char* name; int bit_start; int bits; bool analog; };
         static const std::vector<HidInputMap> stick_map = {
@@ -936,23 +1026,6 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                     b.v.erase(b.v.begin(), b.v.begin() + first_keep);
                 }
 
-                // Plot each input; include input type in label
-                std::string plot_label = std::string(m.name) + " (" + (m.analog ? std::string("Analog") : std::string("Digital")) + ") [" + std::to_string(m.bits) + "b]";
-                if (ImPlot::BeginPlot(plot_label.c_str(), ImVec2(-1, 110), ImPlotFlags_NoTitle)) {
-                    ImPlot::SetupAxes("Time (s)", "Raw", ImPlotAxisFlags_NoTickLabels, ImPlotAxisFlags_AutoFit);
-                    ImPlot::SetupAxisLimits(ImAxis_X1, 0, window, ImGuiCond_Always);
-                    ImPlot::SetupAxisLimits(ImAxis_Y1, (float)y_min, (float)y_max, ImGuiCond_Always);
-                    std::vector<double> xt; xt.reserve(b.t.size());
-                    std::vector<double> yt; yt.reserve(b.v.size());
-                    for (size_t i = 0; i < b.t.size(); ++i) {
-                        double rel = b.t[i] - t0;
-                        if (rel < 0) continue;
-                        xt.push_back(rel);
-                        yt.push_back(b.v[i]);
-                    }
-                    if (!xt.empty()) ImPlot::PlotLine("raw", xt.data(), yt.data(), (int)xt.size());
-                    ImPlot::EndPlot();
-                }
             }
 
                 // Build a ControllerState from logical values (for visualization only)
@@ -976,13 +1049,60 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                 if (getv("E", 0.0) > 0.5) btns |= XINPUT_GAMEPAD_Y;
                 cs.buttons = btns;
                 // Do not inject here; background thread handles injection independent of UI focus.
-        }
+                
+                // Grouped plots per request
+                auto plot_group = [&](const char* title, const std::vector<std::pair<const char*, const char*>>& series, float y_min, float y_max) {
+                    // Build each series from buffered samples
+                    struct S { std::vector<double> x; std::vector<double> y; const char* name; };
+                    std::vector<S> all;
+                    for (auto &p : series) {
+                        auto it = g_hid_buffers.find(p.first);
+                        if (it == g_hid_buffers.end()) continue;
+                        const Buf &buf = it->second;
+                        S s; s.name = p.second;
+                        s.x.reserve(buf.t.size());
+                        s.y.reserve(buf.v.size());
+                        for (size_t i = 0; i < buf.t.size(); ++i) {
+                            double rel = buf.t[i] - t0;
+                            if (rel < 0) continue;
+                            s.x.push_back(rel);
+                            s.y.push_back(buf.v[i]);
+                        }
+                        if (!s.x.empty()) all.push_back(std::move(s));
+                    }
+                    if (all.empty()) return;
+                    if (ImPlot::BeginPlot(title, ImVec2(-1, 130), ImPlotFlags_NoTitle)) {
+                        ImPlot::SetupAxes("Time (s)", "Value", ImPlotAxisFlags_NoTickLabels, ImPlotAxisFlags_AutoFit);
+                        ImPlot::SetupAxisLimits(ImAxis_X1, 0, window, ImGuiCond_Always);
+                        ImPlot::SetupAxisLimits(ImAxis_Y1, y_min, y_max, ImGuiCond_Always);
+                        for (auto &s : all) {
+                            ImPlot::PlotLine(s.name, s.x.data(), s.y.data(), (int)s.x.size());
+                        }
+                        ImPlot::EndPlot();
+                    }
+                };
+
+                // Joy Stick: JOY_X, JOY_Y, JOY_Z (normalized -1..1)
+                plot_group("Joy Stick", { {"JOY_X","x"}, {"JOY_Y","y"}, {"JOY_Z","z"} }, -1.0f, 1.0f);
+                // C-Joy: C_JOY_X, C_JOY_Y (0..255)
+                plot_group("C-Joy", { {"C_JOY_X","x"}, {"C_JOY_Y","y"} }, 0.0f, 255.0f);
+                // Triggers: TRIGGER, BTN_E (0..1)
+                plot_group("Triggers", { {"TRIGGER","Trigger"}, {"BTN_E","pinky trigger"} }, 0.0f, 1.0f);
+                // Buttons: BTN_A, BTN_B, C, BTN_D (0..1)
+                plot_group("Buttons", { {"BTN_A","A"}, {"BTN_B","B"}, {"C","C"}, {"BTN_D","D"} }, 0.0f, 1.0f);
+                // POV: 0..15
+                plot_group("POV", { {"POV","POV"} }, 0.0f, 15.0f);
+                // H1: 0..15
+                plot_group("H1", { {"H1","H1"} }, 0.0f, 15.0f);
+                // H2: 0..15
+                plot_group("H2", { {"H2","H2"} }, 0.0f, 15.0f);
+            }
         ImGui::End();
 
         // HID Live monitor (temporary) - only visible in Developer View
         static bool hid_live_running = false;
         if (show_developer_view) {
-            ImGui::Begin("HID Live");
+            ImGui::Begin("HID Live", nullptr, ImGuiWindowFlags_NoBackground);
             if (!hid_live_running) {
                 if (ImGui::Button("Start HID Live")) { hotas.start_hid_live(); hid_live_running = true; }
             } else {
@@ -1088,7 +1208,7 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             }
         }
 
-        ImGui::Begin("Filtered Signals");
+        ImGui::Begin("Filtered Signals", nullptr, ImGuiWindowFlags_NoBackground);
         {
             auto build_step_series = [](const std::vector<Sample>& in,
                                         double t0,
@@ -1245,6 +1365,8 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     ImGui::DestroyContext();
 
     CleanupDeviceD3D();
+    if (g_backgroundSRV) { g_backgroundSRV->Release(); g_backgroundSRV = nullptr; }
+    CoUninitialize();
     DestroyWindow(hwnd);
     UnregisterClass(wc.lpszClassName, wc.hInstance);
     return 0;

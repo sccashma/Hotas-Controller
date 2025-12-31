@@ -41,7 +41,8 @@ struct HotasReader::HotasReaderInternalState {
     std::vector<std::thread> live_threads;
     std::vector<HANDLE> live_handles;
     mutable std::mutex live_mutex;
-    std::map<std::string, std::string> live_last_hex; // devicePath -> hex
+    struct LiveEntry { std::string hex; double ts; };
+    std::map<std::string, LiveEntry> live_last; // devicePath -> {hex, timestamp}
 };
 
 static std::vector<std::string> s_debug_lines;
@@ -160,7 +161,7 @@ void HotasReader::start_hid_live() {
             (path.find("vid_0738&pid_a221") != std::string::npos && path.find("mi_00") != std::string::npos)) {
             paths.push_back(wp);
             std::lock_guard<std::mutex> g(internal_state->live_mutex);
-            internal_state->live_last_hex[path] = std::string("(no data yet)");
+            internal_state->live_last[path] = HotasReader::HotasReaderInternalState::LiveEntry{ std::string("(no data yet)"), 0.0 };
         }
     }
     SetupDiDestroyDeviceInfoList(devInfo);
@@ -175,7 +176,7 @@ void HotasReader::start_hid_live() {
             std::lock_guard<std::mutex> g(internal_state->live_mutex);
             internal_state->live_handles.push_back(h);
             // Register the path so UI shows it even before any reports arrive
-            internal_state->live_last_hex[path] = "";
+            internal_state->live_last[path] = HotasReader::HotasReaderInternalState::LiveEntry{ std::string("(no data yet)"), 0.0 };
         }
         internal_state->live_threads.emplace_back([this, h, path]() {
             const size_t buf_sz = 64;
@@ -200,8 +201,14 @@ void HotasReader::start_hid_live() {
                 }
                 if (read > 0) {
                     std::string hex = to_hex(rbuf.data(), read);
+                    double ts = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
                     std::lock_guard<std::mutex> g(internal_state->live_mutex);
-                    internal_state->live_last_hex[path] = hex;
+                    internal_state->live_last[path] = HotasReader::HotasReaderInternalState::LiveEntry{ hex, ts };
+                } else {
+                    // mark as no data yet
+                    std::lock_guard<std::mutex> g(internal_state->live_mutex);
+                    auto it = internal_state->live_last.find(path);
+                    if (it != internal_state->live_last.end()) it->second.hex = std::string("(no data yet)");
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
@@ -222,7 +229,7 @@ void HotasReader::stop_hid_live() {
         std::lock_guard<std::mutex> g(internal_state->live_mutex);
         for (auto h : internal_state->live_handles) { if (h != INVALID_HANDLE_VALUE) CloseHandle(h); }
         internal_state->live_handles.clear();
-        internal_state->live_last_hex.clear();
+        internal_state->live_last.clear();
     }
 }
 
@@ -230,7 +237,7 @@ std::vector<std::pair<std::string,std::string>> HotasReader::get_hid_live_snapsh
     std::vector<std::pair<std::string,std::string>> out;
     if (!internal_state) return out;
     std::lock_guard<std::mutex> g(internal_state->live_mutex);
-    for (auto &p : internal_state->live_last_hex) out.emplace_back(p.first, p.second);
+    for (auto &p : internal_state->live_last) out.emplace_back(p.first, p.second.hex);
     return out;
 }
 
@@ -357,15 +364,20 @@ HotasSnapshot HotasReader::poll_once() {
     HotasSnapshot snap;
     if (!internal_state) return snap;
 
-    // Grab latest HID hex for known device paths (stick/throttle)
+    // Grab latest HID hex for known device paths (stick/throttle), requiring freshness
     std::string stick_hex;
     std::string throttle_hex;
+    double now_sec = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    const double fresh_thresh = 0.5; // seconds
     {
         std::lock_guard<std::mutex> g(internal_state->live_mutex);
-        for (const auto& kv : internal_state->live_last_hex) {
+        for (const auto& kv : internal_state->live_last) {
             const std::string& path = kv.first;
-            const std::string& hex  = kv.second;
+            const auto& entry  = kv.second;
+            const std::string& hex  = entry.hex;
             if (hex.empty() || hex == "(no data yet)") continue;
+            // Require recent updates to avoid using stale data after disconnect
+            if (entry.ts <= 0.0 || (now_sec - entry.ts) > fresh_thresh) continue;
             if (path.find("vid_0738&pid_2221") != std::string::npos && path.find("mi_00") != std::string::npos) {
                 stick_hex = hex;
             } else if (path.find("vid_0738&pid_a221") != std::string::npos && path.find("mi_00") != std::string::npos) {

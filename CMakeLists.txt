@@ -108,7 +108,7 @@ endif()
 
 add_subdirectory(external/ViGEmClient)
 
-target_link_libraries(${PROJECT_NAME} PRIVATE imgui_lib d3d11 dxgi ViGEmClient setupapi)
+target_link_libraries(${PROJECT_NAME} PRIVATE imgui_lib d3d11 dxgi ViGEmClient setupapi Windowscodecs)
 
 target_include_directories(${PROJECT_NAME} PRIVATE external/ViGEmClient/include)
 
