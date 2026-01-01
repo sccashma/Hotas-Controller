@@ -1,0 +1,22 @@
+{
+  "mappings": [
+    {
+      "action": "x360:left_x",
+      "id": "m1",
+      "param": 1.0,
+      "signal_id": "joy_x"
+    },
+    {
+      "action": "x360:left_y",
+      "id": "m2",
+      "param": 1.0,
+      "signal_id": "joy_y"
+    },
+    {
+      "action": "x360:right_y",
+      "id": "m3",
+      "param": 1.0,
+      "signal_id": "left_throttle"
+    }
+  ]
+}

@@ -11,7 +11,7 @@ The active implementation is native C++ using Dear ImGui + ImPlot. A legacy Pyth
 * Gated digital filtering: presses must reach a minimum duration before promotion.
 * Analog spike suppression using absolute delta thresholds.
 * Optional virtual Xbox 360 output when ViGEm client & driver are available.
-* Persistent settings (`filter_settings.cfg`) for filter + runtime parameters.
+* Persistent settings (`config/filter_settings.cfg`) for filter + runtime parameters.
 * Automatic three‑column dock layout (Control | Raw Signals | Filtered Signals).
 
 ## Signal Names
@@ -36,7 +36,7 @@ Analog inputs apply spike suppression per axis: if `|current - previous| >= anal
 * Optional: ViGEmBus driver + client (submodule) for virtual output
 
 ## Build
-Default CMake options (see `CMakeLists.txt`):
+Default CMake options (see [CMakeLists.txt](CMakeLists.txt)):
 * `BUILD_STATIC` = OFF (set ON to link static MSVC runtime)
 * `WITH_DEMOS`  = OFF (set ON to include ImGui/ImPlot demo windows)
 
@@ -47,6 +47,9 @@ cmake --build build --config Release --target hotas_controller
 ```
 
 Binary: `build/Release/hotas_controller.exe`
+Runtime config directory: `build/Release/config/`
+- Contains `filter_settings.cfg`, `mappings.json`, and `X56_Hotas_hid_bit_map.csv` copied from [res/config](res/config).
+- The application loads and saves these files from `config/` next to the executable.
 
 MSVC security / hardening flags applied: `/sdl`, `/guard:cf`, `/DYNAMICBASE`, `/NXCOMPAT`.
 
@@ -57,7 +60,7 @@ git submodule update --init --recursive
 ```
 
 ### Configuration File
-`filter_settings.cfg` (created/saved by explicit **Save Settings** action) contains:
+`config/filter_settings.cfg` (created/saved by explicit **Save Settings** action) contains:
 ```
 enabled=0|1
 analog_delta=<float>
@@ -84,6 +87,7 @@ No automatic save on exit; use **Save Settings** to persist changes.
 * `src/ui/plots_panel.*` – plot generation & step series creation.
 * `src/core/ring_buffer.hpp` – storage for high‑rate sample history.
 * `external/ViGEmClient/` – ViGEm client library (submodule).
+* CSV descriptor source: [res/config/X56_Hotas_hid_bit_map.csv](res/config/X56_Hotas_hid_bit_map.csv) – loaded at runtime; becomes [build/Release/config/X56_Hotas_hid_bit_map.csv](build/Release/config/X56_Hotas_hid_bit_map.csv).
 
 ## Performance Notes
 * Very high target rates (> 4 kHz) may be CPU intensive; the loop uses sleep + short spin to hit deadlines.
@@ -119,12 +123,12 @@ Quick steps (UI)
 - Click "Add Mapping" to create the mapping; use Save/Load to persist via the UI (calls [`HotasMapper::save_profile`](src/xinput/hotas_mapper.cpp) / [`HotasMapper::load_profile`](src/xinput/hotas_mapper.cpp)).
 
 Mapping internals
-- A mapping is represented by [`MappingEntry`](src/xinput/hotas_mapper.hpp) and stored/loaded as JSON in `mappings.json` (example in [`mappings.json`](mappings.json)).
+- A mapping is represented by [`MappingEntry`](src/xinput/hotas_mapper.hpp) and stored/loaded as JSON in `config/mappings.json` (default in [res/config/mappings.json](res/config/mappings.json)).
 - New logical samples are fed into the mapper via [`HotasMapper::accept_sample`](src/xinput/hotas_mapper.cpp) (called from the HOTAS raw parser / UI code).
 - The mapper publishes mapped X360 reports at its publish rate and uses ViGEm to emit a virtual controller (see [`src/xinput/hotas_mapper.cpp`](src/xinput/hotas_mapper.cpp) and the ViGEm client submodule at [`external/ViGEmClient`](external/ViGEmClient)).
 
 Injection flow (high level)
-- HOTAS raw reports → parsed by [`HotasReader::get_hid_live_snapshot` / `list_signals`](src/xinput/hotas_reader.cpp) → logical values passed to [`HotasMapper::accept_sample`](src/xinput/hotas_mapper.cpp) → mapper publishes to virtual device (ViGEm) in [`HotasMapper::publisher_thread_main`](src/xinput/hotas_mapper.cpp).
+- HOTAS raw reports → parsed by [`HotasReader::get_hid_live_snapshot` / `list_signals`](src/xinput/hotas_reader.cpp) using descriptors from `config/X56_Hotas_hid_bit_map.csv` → logical values passed to [`HotasMapper::accept_sample`](src/xinput/hotas_mapper.cpp) → mapper publishes to virtual device (ViGEm) in [`HotasMapper::publisher_thread_main`](src/xinput/hotas_mapper.cpp).
 - The UI wires mapper injection into the app poller via [`HotasMapper::set_inject_callback`](src/xinput/hotas_mapper.cpp) / the call in [`src/main.cpp`](src/main.cpp) which injects mapped states into the `XInputPoller` for filtering/forwarding.
 
 File references

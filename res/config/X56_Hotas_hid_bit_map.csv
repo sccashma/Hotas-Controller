@@ -15,7 +15,7 @@ Stick,738,2221,Digital-Multi,H1,62-65,4,"Up, right, down, left are the buttons, 
 Stick,738,2221,Digital-Multi,H2,66-69,4,"Up, right, down, left are the buttons, but supports combinations. E.g. up-right, down-left but not up-down, or left-right for example."
 Throttle,738,a221,Analog,left_throttle,8-17,10,
 Throttle,738,a221,Analog,right_throttle,18-27,10,
-Throttle,738,a221,Analog,F_wheel,67-71,8,
+Throttle,738,a221,Analog,F_wheel,64-71,8,
 Throttle,738,a221,Analog,G-wheel,80-87,8,
 Throttle,738,a221,Analog,RTY3,104-111,8,
 Throttle,738,a221,Analog,RTY4,96-103,8,

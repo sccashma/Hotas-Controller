@@ -25,12 +25,14 @@
 #include <map>
 #include <mutex>
 #include <algorithm>
+#include <fstream>
 
 struct HotasReader::HotasReaderInternalState {
     // Devices will be opened via HID/raw APIs later; keep storage for axes
     SampleRing joy_x{1u<<18};
     SampleRing joy_y{1u<<18};
     std::atomic<double> latest{0.0};
+    std::vector<SignalDescriptor> signals; // loaded from CSV on startup
 
     // HID device handles (invalid if not opened)
     HANDLE stick_handle = INVALID_HANDLE_VALUE;
@@ -126,6 +128,132 @@ HotasReader::HotasReader() {
     }
 
     SetupDiDestroyDeviceInfoList(devInfo);
+
+    // Load signal descriptors from CSV (single source of truth)
+    auto load_csv_signals = [&](const wchar_t* path)->bool {
+        std::string sp = wcs_to_utf8(path);
+        std::ifstream in(sp.c_str());
+        if (!in) return false;
+        std::string line;
+        // Skip header
+        if (!std::getline(in, line)) return false;
+        std::vector<SignalDescriptor> sigs;
+        while (std::getline(in, line)) {
+            if (line.empty()) continue;
+            // Basic CSV split (no quoted field parsing beyond notes at end)
+            std::vector<std::string> cols; cols.reserve(8);
+            size_t pos = 0;
+            while (pos < line.size()) {
+                size_t comma = line.find(',', pos);
+                if (comma == std::string::npos) comma = line.size();
+                cols.emplace_back(line.substr(pos, comma - pos));
+                pos = (comma == line.size()) ? comma : (comma + 1);
+            }
+            if (cols.size() < 7) continue;
+            std::string device = cols[0];
+            std::string inputType = cols[3];
+            std::string inputId = cols[4];
+            std::string bitRange = cols[5];
+            std::string bitsStr = cols[6];
+            // Parse bit_start from range "A-B" or single number
+            int bit_start = 0; int bits = 0;
+            try {
+                size_t dash = bitRange.find('-');
+                if (dash == std::string::npos) bit_start = std::stoi(bitRange);
+                else bit_start = std::stoi(bitRange.substr(0, dash));
+                bits = std::stoi(bitsStr);
+            } catch (...) { continue; }
+            bool analog = false;
+            {
+                std::string t = inputType; 
+                for (auto &c : t) c = (char)tolower((unsigned char)c);
+                analog = (t.find("analog") != std::string::npos);
+            }
+            // Build display name: uppercase with '-' -> '_' and id-specific casing
+            auto to_upper_underscore = [](std::string s){
+                for (auto &c : s) {
+                    if (c == '-') c = '_';
+                    else c = (char)toupper((unsigned char)c);
+                }
+                return s;
+            };
+            std::string name = to_upper_underscore(inputId);
+            // Normalize known variants
+            if (name == "G-WHEEL") name = "G_WHEEL";
+            HotasReader::SignalDescriptor::DeviceKind dk = HotasReader::SignalDescriptor::DeviceKind::Stick;
+            {
+                std::string d = device; for (auto &c : d) c = (char)tolower((unsigned char)c);
+                if (d.find("throttle") != std::string::npos) dk = HotasReader::SignalDescriptor::DeviceKind::Throttle;
+                else dk = HotasReader::SignalDescriptor::DeviceKind::Stick;
+            }
+            SignalDescriptor sd{ inputId, name, bit_start, bits, analog, dk };
+            sigs.push_back(sd);
+        }
+        internal_state->signals = std::move(sigs);
+        return !internal_state->signals.empty();
+    };
+    // Try common relative locations from build directory
+    if (!load_csv_signals(L"config\\X56_Hotas_hid_bit_map.csv")) {
+        if (!load_csv_signals(L"..\\X56_Hotas_hid_bit_map.csv")) {
+            load_csv_signals(L"..\\..\\X56_Hotas_hid_bit_map.csv");
+        }
+    }
+    // Fallback to built-in minimal set if CSV missing
+    if (internal_state->signals.empty()) {
+        internal_state->signals = std::vector<SignalDescriptor>{
+            {"joy_x","JOY_X",8,16,true, SignalDescriptor::DeviceKind::Stick},
+            {"joy_y","JOY_Y",24,16,true, SignalDescriptor::DeviceKind::Stick},
+            {"joy_z","JOY_Z",40,12,true, SignalDescriptor::DeviceKind::Stick},
+            {"c_joy_x","C_JOY_X",80,8,true, SignalDescriptor::DeviceKind::Stick},
+            {"c_joy_y","C_JOY_Y",88,8,true, SignalDescriptor::DeviceKind::Stick},
+            {"C","C",59,1,false, SignalDescriptor::DeviceKind::Stick},
+            {"trigger","TRIGGER",56,1,false, SignalDescriptor::DeviceKind::Stick},
+            {"A","BTN_A",57,1,false, SignalDescriptor::DeviceKind::Stick},
+            {"B","BTN_B",58,1,false, SignalDescriptor::DeviceKind::Stick},
+            {"D","BTN_D",60,1,false, SignalDescriptor::DeviceKind::Stick},
+            {"E","BTN_E",61,1,false, SignalDescriptor::DeviceKind::Stick},
+            {"POV","POV",52,4,false, SignalDescriptor::DeviceKind::Stick},
+            {"H1","H1",62,4,false, SignalDescriptor::DeviceKind::Stick},
+            {"H2","H2",66,4,false, SignalDescriptor::DeviceKind::Stick},
+            {"left_throttle","LEFT_THROTTLE",8,10,true, SignalDescriptor::DeviceKind::Throttle},
+            {"right_throttle","RIGHT_THROTTLE",18,10,true, SignalDescriptor::DeviceKind::Throttle},
+            {"F_wheel","F_WHEEL",67,8,true, SignalDescriptor::DeviceKind::Throttle},
+            {"G_wheel","G_WHEEL",80,8,true, SignalDescriptor::DeviceKind::Throttle},
+            {"RTY3","RTY3",104,8,true, SignalDescriptor::DeviceKind::Throttle},
+            {"RTY4","RTY4",96,8,true, SignalDescriptor::DeviceKind::Throttle},
+            {"thumb_joy_x","THUMB_JOY_X",72,8,true, SignalDescriptor::DeviceKind::Throttle},
+            {"thumb_joy_y","THUMB_JOY_Y",88,8,true, SignalDescriptor::DeviceKind::Throttle},
+            {"pinky_encoder","PINKY_ENCODER",57,2,false, SignalDescriptor::DeviceKind::Throttle},
+            {"thumb_joy_press","THUMB_JOY_PRESS",59,1,false, SignalDescriptor::DeviceKind::Throttle},
+            {"E_th","E",28,1,false, SignalDescriptor::DeviceKind::Throttle},
+            {"F_th","F",29,1,false, SignalDescriptor::DeviceKind::Throttle},
+            {"G_th","G",30,1,false, SignalDescriptor::DeviceKind::Throttle},
+            {"H_th","H",32,1,false, SignalDescriptor::DeviceKind::Throttle},
+            {"I_th","I",31,1,false, SignalDescriptor::DeviceKind::Throttle},
+            {"K1_up","K1_UP",55,1,false, SignalDescriptor::DeviceKind::Throttle},
+            {"K1_down","K1_DOWN",56,1,false, SignalDescriptor::DeviceKind::Throttle},
+            {"slide","SLIDE",60,1,false, SignalDescriptor::DeviceKind::Throttle},
+            {"SW1","SW1",33,1,false, SignalDescriptor::DeviceKind::Throttle},
+            {"SW2","SW2",34,1,false, SignalDescriptor::DeviceKind::Throttle},
+            {"SW3","SW3",35,1,false, SignalDescriptor::DeviceKind::Throttle},
+            {"SW4","SW4",36,1,false, SignalDescriptor::DeviceKind::Throttle},
+            {"SW5","SW5",37,1,false, SignalDescriptor::DeviceKind::Throttle},
+            {"SW6","SW6",38,1,false, SignalDescriptor::DeviceKind::Throttle},
+            {"TGL1_up","TGL1_UP",39,1,false, SignalDescriptor::DeviceKind::Throttle},
+            {"TGL1_down","TGL1_DOWN",40,1,false, SignalDescriptor::DeviceKind::Throttle},
+            {"TGL2_up","TGL2_UP",41,1,false, SignalDescriptor::DeviceKind::Throttle},
+            {"TGL2_down","TGL2_DOWN",42,1,false, SignalDescriptor::DeviceKind::Throttle},
+            {"TGL3_up","TGL3_UP",43,1,false, SignalDescriptor::DeviceKind::Throttle},
+            {"TGL3_down","TGL3_DOWN",44,1,false, SignalDescriptor::DeviceKind::Throttle},
+            {"TGL4_up","TGL4_UP",45,1,false, SignalDescriptor::DeviceKind::Throttle},
+            {"TGL4_down","TGL4_DOWN",46,1,false, SignalDescriptor::DeviceKind::Throttle},
+            {"M1","M1",61,1,false, SignalDescriptor::DeviceKind::Throttle},
+            {"M2","M2",62,1,false, SignalDescriptor::DeviceKind::Throttle},
+            {"S1","S1",63,1,false, SignalDescriptor::DeviceKind::Throttle},
+            {"H3","H3",47,4,false, SignalDescriptor::DeviceKind::Throttle},
+            {"H4","H4",51,4,false, SignalDescriptor::DeviceKind::Throttle}
+        };
+    }
 }
 
 static std::string to_hex(const uint8_t* d, size_t n) {
@@ -288,62 +416,8 @@ std::vector<std::string> HotasReader::enumerate_devices() {
 }
 
 std::vector<HotasReader::SignalDescriptor> HotasReader::list_signals() const {
-    // Combined signal set for X56 Stick and Throttle (from CSV mapping)
-    return std::vector<SignalDescriptor>{
-        // Stick (VID 0x0738, PID 0x2221)
-        {"joy_x","JOY_X",8,16,true},
-        {"joy_y","JOY_Y",24,16,true},
-        {"joy_z","JOY_Z",40,12,true},
-        {"c_joy_x","C_JOY_X",80,8,true},
-        {"c_joy_y","C_JOY_Y",88,8,true},
-        {"C","C_BTN",59,1,false},
-        {"trigger","TRIGGER",56,1,false},
-        {"A","BTN_A",57,1,false},
-        {"B","BTN_B",58,1,false},
-        {"D","BTN_D",60,1,false},
-        {"E","BTN_E",61,1,false},
-        {"POV","POV",52,4,false},
-        {"H1","H1",62,4,false},
-        {"H2","H2",66,4,false},
-        // Throttle (VID 0x0738, PID 0xA221)
-        {"left_throttle","LEFT_THROTTLE",8,10,true},
-        {"right_throttle","RIGHT_THROTTLE",18,10,true},
-        {"F_wheel","F_WHEEL",67,8,true},
-        {"G_wheel","G_WHEEL",80,8,true},
-        {"RTY3","RTY3",104,8,true},
-        {"RTY4","RTY4",96,8,true},
-        {"thumb_joy_x","THUMB_JOY_X",72,8,true},
-        {"thumb_joy_y","THUMB_JOY_Y",88,8,true},
-        {"pinky_encoder","PINKY_ENCODER",57,2,false},
-        {"thumb_joy_press","THUMB_JOY_PRESS",59,1,false},
-        {"E_th","E",28,1,false},
-        {"F_th","F",29,1,false},
-        {"G_th","G",30,1,false},
-        {"H_th","H",32,1,false},
-        {"I_th","I",31,1,false},
-        {"K1_up","K1_UP",55,1,false},
-        {"K1_down","K1_DOWN",56,1,false},
-        {"slide","SLIDE",60,1,false},
-        {"SW1","SW1",33,1,false},
-        {"SW2","SW2",34,1,false},
-        {"SW3","SW3",35,1,false},
-        {"SW4","SW4",36,1,false},
-        {"SW5","SW5",37,1,false},
-        {"SW6","SW6",38,1,false},
-        {"TGL1_up","TGL1_UP",39,1,false},
-        {"TGL1_down","TGL1_DOWN",40,1,false},
-        {"TGL2_up","TGL2_UP",41,1,false},
-        {"TGL2_down","TGL2_DOWN",42,1,false},
-        {"TGL3_up","TGL3_UP",43,1,false},
-        {"TGL3_down","TGL3_DOWN",44,1,false},
-        {"TGL4_up","TGL4_UP",45,1,false},
-        {"TGL4_down","TGL4_DOWN",46,1,false},
-        {"M1","M1",61,1,false},
-        {"M2","M2",62,1,false},
-        {"S1","S1",63,1,false},
-        {"H3","H3",47,4,false},
-        {"H4","H4",51,4,false}
-    };
+    if (!internal_state) return {};
+    return internal_state->signals;
 }
 
 HotasReader::~HotasReader() {
@@ -407,6 +481,8 @@ HotasSnapshot HotasReader::poll_once() {
     std::string stick_hex;
     std::string throttle_hex;
     double now_sec = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    // Advance UI timebase on every poll to avoid apparent freezes when inputs idle
+    internal_state->latest.store(now_sec, std::memory_order_release);
     const double fresh_thresh = 0.5; // seconds
     {
         std::lock_guard<std::mutex> g(internal_state->live_mutex);
@@ -473,7 +549,6 @@ HotasSnapshot HotasReader::poll_once() {
     if (any_ok) {
         snap.ok = true;
         snap.state = cs;
-        internal_state->latest.store((double)std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_release);
     } else {
         // No parsed HID data available; do not inject a zero-state snapshot.
         snap.ok = false;

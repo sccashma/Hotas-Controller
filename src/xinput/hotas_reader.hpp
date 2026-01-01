@@ -49,6 +49,7 @@ public:
         int bit_start;
         int bits;
         bool analog;
+        enum class DeviceKind { Stick, Throttle } device; // origin device
     };
     // List signals known by the reader (useful for mapping UI)
     std::vector<SignalDescriptor> list_signals() const;

@@ -279,7 +279,7 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     }
 
     // Load persisted settings before starting poller (overrides defaults if present)
-    FilterSettings filter_settings; LoadFilterSettings("filter_settings.cfg", filter_settings);
+    FilterSettings filter_settings; LoadFilterSettings("config/filter_settings.cfg", filter_settings);
 
     // Clamp loaded values to sane ranges
     if (g_window_seconds < 1.0) g_window_seconds = 1.0; else if (g_window_seconds > 60.0) g_window_seconds = 60.0;
@@ -290,7 +290,7 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     HotasReader hotas;
     HotasMapper hotas_mapper;
     // Load persisted HOTAS mappings at startup
-    hotas_mapper.load_profile("mappings.json");
+    hotas_mapper.load_profile("config/mappings.json");
     // Do not inject mapped states back into the poller; forwarder handles output.
     static bool show_hotas_detect_window = false;
     static std::vector<std::string> hotas_detect_lines;
@@ -330,6 +330,8 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             if (hotas_bg_enabled.load()) {
                 auto snap = hotas.poll_once();
                 auto now_tp = clock::now();
+                // Connection-based liveness: prefer handle visibility over report freshness.
+                bool connected = hotas.has_stick() || hotas.has_throttle();
                 if (snap.ok) {
                     last_ok_tp = now_tp;
                     if (!hotas_detected.exchange(true)) {
@@ -343,12 +345,15 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                     // Inject the raw HOTAS state into the poller pipeline (poller -> filter -> mapper -> output)
                     poller.inject_state(now, snap.state);
                 } else {
-                    // If we've had no valid HOTAS data for >1s, refresh HID live to re-enumerate devices
-                    if (now_tp - last_ok_tp > std::chrono::seconds(1) && now_tp >= next_refresh_tp) {
+                    // If no valid HOTAS data is arriving, only re-enumerate when devices appear disconnected.
+                    if (!connected && (now_tp - last_ok_tp > std::chrono::seconds(1)) && now_tp >= next_refresh_tp) {
                         hotas.stop_hid_live();
                         hotas.start_hid_live();
                         next_refresh_tp = now_tp + std::chrono::seconds(2); // cooldown to avoid busy re-enumeration
                         hotas_detected.store(false, std::memory_order_release);
+                    } else if (connected) {
+                        // Maintain detection flag when devices are present even if reports are momentarily idle.
+                        hotas_detected.store(true, std::memory_order_release);
                     }
                 }
             }
@@ -535,6 +540,13 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             ImGui::Text("Avg loop: %.2f us", stats.avg_loop_us);
         }
         ImGui::TextDisabled("Polling rate: 1000 Hz (fixed)");
+        // Connection status (independent of report liveness)
+        {
+            bool stick_conn = hotas.has_stick();
+            bool throttle_conn = hotas.has_throttle();
+            ImGui::Text("HOTAS Stick: %s", stick_conn ? "Connected" : "Not Connected");
+            ImGui::Text("HOTAS Throttle: %s", throttle_conn ? "Connected" : "Not Connected");
+        }
         // Window length controls (1 - 60 seconds)
         double win = raw_panel.window_seconds();
         double win_min = 1.0, win_max = 60.0;
@@ -684,7 +696,7 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                             raw_panel.set_trigger_digital(filter_settings.left_trigger_digital, filter_settings.right_trigger_digital);
                         }
                         // Persist current runtime + filter settings
-                        SaveFilterSettings("filter_settings.cfg", filter_settings);
+                        SaveFilterSettings("config/filter_settings.cfg", filter_settings);
                         // Update snapshots
                         saved_window_seconds = g_window_seconds;
                         filter_dirty = false;
@@ -759,12 +771,12 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             ImGui::SetItemTooltip("Refresh the mapping list from the current session.");
             ImGui::SameLine();
             if (ImGui::Button("Save...")) {
-                hotas_mapper.save_profile("mappings.json");
+                hotas_mapper.save_profile("config/mappings.json");
             }
             ImGui::SetItemTooltip("Save all mappings to 'mappings.json' in the application directory for persistence across runs.");
             ImGui::SameLine();
             if (ImGui::Button("Load...")) {
-                hotas_mapper.load_profile("mappings.json");
+                hotas_mapper.load_profile("config/mappings.json");
             }
             ImGui::SetItemTooltip("Load mappings from 'mappings.json', replacing the current mapping list.");
             ImGui::Separator();
@@ -904,63 +916,18 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
         // Stick window: parse HID live hex and show raw integer graphs for stick inputs
         ImGui::Begin("Stick", nullptr, ImGuiWindowFlags_NoBackground);
-        // Mapping from CSV: device stick (Saitek X56)
-        struct HidInputMap { const char* id; const char* name; int bit_start; int bits; bool analog; };
-        static const std::vector<HidInputMap> stick_map = {
-            {"joy_x",   "JOY_X",   8, 16, true},
-            {"joy_y",   "JOY_Y",  24, 16, true},
-            {"joy_z",   "JOY_Z",  40, 12, true},
-            {"c_joy_x", "C_JOY_X",80,  8, true},
-            {"c_joy_y", "C_JOY_Y",88,  8, true},
-            {"C",       "C",      59,  1, false},
-            {"trigger", "TRIGGER",56,  1, false},
-            {"A",       "BTN_A",  57,  1, false},
-            {"B",       "BTN_B",  58,  1, false},
-            {"D",       "BTN_D",  60,  1, false},
-            {"E",       "BTN_E",  61,  1, false},
-            {"POV",     "POV",    52,  4, false},
-            {"H1",      "H1",     62,  4, false},
-            {"H2",      "H2",     66,  4, false},
-        };
-        static const std::vector<HidInputMap> throttle_map = {
-            {"left_throttle",  "LEFT_THROTTLE",   8,  10, true},
-            {"right_throttle", "RIGHT_THROTTLE", 18,  10, true},
-            {"F_wheel",        "F_WHEEL",        67,   8, true},
-            {"G_wheel",        "G_WHEEL",        80,   8, true},
-            {"RTY3",           "RTY3",          104,   8, true},
-            {"RTY4",           "RTY4",           96,   8, true},
-            {"thumb_joy_x",    "THUMB_JOY_X",    72,   8, true},
-            {"thumb_joy_y",    "THUMB_JOY_Y",    88,   8, true},
-            {"pinky_encoder",  "PINKY_ENCODER",  57,   2, false},
-            {"thumb_joy_press","THUMB_JOY_PRESS",59,   1, false},
-            {"E_th",           "E",              28,   1, false},
-            {"F_th",           "F",              29,   1, false},
-            {"G_th",           "G",              30,   1, false},
-            {"H_th",           "H",              32,   1, false},
-            {"I_th",           "I",              31,   1, false},
-            {"K1_up",          "K1_UP",          55,   1, false},
-            {"K1_down",        "K1_DOWN",        56,   1, false},
-            {"slide",          "SLIDE",          60,   1, false},
-            {"SW1",            "SW1",            33,   1, false},
-            {"SW2",            "SW2",            34,   1, false},
-            {"SW3",            "SW3",            35,   1, false},
-            {"SW4",            "SW4",            36,   1, false},
-            {"SW5",            "SW5",            37,   1, false},
-            {"SW6",            "SW6",            38,   1, false},
-            {"TGL1_up",        "TGL1_UP",        39,   1, false},
-            {"TGL1_down",      "TGL1_DOWN",      40,   1, false},
-            {"TGL2_up",        "TGL2_UP",        41,   1, false},
-            {"TGL2_down",      "TGL2_DOWN",      42,   1, false},
-            {"TGL3_up",        "TGL3_UP",        43,   1, false},
-            {"TGL3_down",      "TGL3_DOWN",      44,   1, false},
-            {"TGL4_up",        "TGL4_UP",        45,   1, false},
-            {"TGL4_down",      "TGL4_DOWN",      46,   1, false},
-            {"M1",             "M1",             61,   1, false},
-            {"M2",             "M2",             62,   1, false},
-            {"S1",             "S1",             63,   1, false},
-            {"H3",             "H3",             47,   4, false},
-            {"H4",             "H4",             51,   4, false},
-        };
+        // Build maps dynamically from HotasReader::list_signals() (CSV-driven)
+        struct HidInputMap { std::string id; std::string name; int bit_start; int bits; bool analog; };
+        std::vector<HidInputMap> stick_map;
+        std::vector<HidInputMap> throttle_map;
+        {
+            auto sigs = hotas.list_signals();
+            for (const auto &sd : sigs) {
+                HidInputMap m{ sd.id, sd.name, sd.bit_start, sd.bits, sd.analog };
+                if (sd.device == HotasReader::SignalDescriptor::DeviceKind::Stick) stick_map.push_back(m);
+                else throttle_map.push_back(m);
+            }
+        }
 
         // Per-signal sample buffers
         struct Buf { std::vector<double> t, v; };
