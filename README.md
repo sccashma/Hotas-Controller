@@ -118,7 +118,7 @@ Quick steps (UI)
 - Signal: populated from the runtime HOTAS signal list (`[`HotasReader::list_signals`](src/xinput/hotas_reader.cpp)` / [`src/xinput/hotas_reader.hpp`](src/xinput/hotas_reader.hpp)`).
 - Action Type: select one of:
   - x360 — maps to a virtual Xbox 360 input (labels defined in [`src/main.cpp`](src/main.cpp))
-  - keyboard — sends key (e.g. "VK_SPACE" or 'A')
+  - keyboard — sends key (e.g. "VK_SPACE" or 'A'); use the new visual keyboard picker ("Pick...") next to the field to choose keys without typing codes
   - mouse — sends mouse actions (e.g. left_click)
 - Click "Add Mapping" to create the mapping; use Save/Load to persist via the UI (calls [`HotasMapper::save_profile`](src/xinput/hotas_mapper.cpp) / [`HotasMapper::load_profile`](src/xinput/hotas_mapper.cpp)).
 
@@ -141,5 +141,6 @@ File references
 
 Notes & tips
 - Use the device filter to reduce the signal list to Stick or Throttle when authoring mappings.
+- The keyboard picker mirrors a standard US layout and fills the field with supported names (VK_* constants or single characters). Keys auto‑repeat while held based on system keyboard settings.
 - After editing `mappings.json` manually, use Load in the Mappings UI to apply.
 - If ViGEm is not Ready the x360 action targets will not be emitted; check ViGEm status in the Control panel (see [`src/xinput/hotas_mapper.cpp`](src/xinput/hotas_mapper.cpp) and [`external/ViGEmClient`](external/ViGEmClient)).

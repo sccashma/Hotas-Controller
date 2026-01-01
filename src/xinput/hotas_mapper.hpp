@@ -24,7 +24,6 @@ struct MappingEntry {
     std::string id;         // unique mapping id (e.g. "m1")
     std::string signal_id;  // e.g. "joy_x", "A", etc.
     std::string action;     // action descriptor (e.g. "x360:left_x")
-    double param = 0.0;     // optional parameter (deadzone, scale, etc.)
 };
 
 class HotasMapper {

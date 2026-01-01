@@ -1,4 +1,7 @@
 // Docking enabled globally via CMake compile definitions.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <d3d11.h>
 #include <tchar.h>
@@ -7,22 +10,91 @@
 #include <vector>
 #include <memory>
 #include <chrono>
+#include <algorithm>
+#include <cmath>
 
 #include <imgui.h>
 #include <implot.h>
 #include <imgui_internal.h>
 #include <mmsystem.h>
 #include <wincodec.h>
+#include <lunasvg.h>
+#include <dxgi.h>
+#include <d2d1.h>
+#include <d2d1_1.h>
+#include <d2d1_1helper.h>
+#include <d2d1svg.h>
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "Windowscodecs.lib")
 #include "xinput/xinput_poll.hpp"
-#include "ui/plots_panel.hpp"
 #include <fstream>
 #include <sstream>
 #include <unordered_map>
 #include "xinput/filtered_forwarder.hpp"
 #include "xinput/hotas_reader.hpp"
 #include "xinput/hotas_mapper.hpp"
+
+// Shared HID buffers for raw Stick/Throttle plotting
+struct HidBuf { std::vector<double> t; std::vector<double> v; };
+static std::unordered_map<std::string, HidBuf> g_hid_buffers;
+// Filtered HID buffers (post per-signal filtering)
+static std::unordered_map<std::string, HidBuf> g_hid_filtered_buffers;
+
+// Helper to build canonical device-prefixed keys to avoid stick/throttle collisions
+static inline const char* device_prefix(HotasReader::SignalDescriptor::DeviceKind dk) {
+    return (dk == HotasReader::SignalDescriptor::DeviceKind::Stick) ? "stick" : "throttle";
+}
+
+// Common raw HID plotter with slight Y padding and fixed ticks for standard ranges
+static void PlotHidGroup(const char* title,
+                         const std::unordered_map<std::string, HidBuf>& buffers,
+                         const std::vector<std::pair<const char*, const char*>>& series,
+                         double window,
+                         double t0,
+                         float y_min,
+                         float y_max) {
+    struct S { std::vector<double> x; std::vector<double> y; const char* name; };
+    std::vector<S> all;
+    for (auto &p : series) {
+        auto it = buffers.find(p.first);
+        if (it == buffers.end()) continue;
+        const HidBuf &buf = it->second;
+        S s; s.name = p.second;
+        s.x.reserve(buf.t.size());
+        s.y.reserve(buf.v.size());
+        for (size_t i = 0; i < buf.t.size(); ++i) {
+            double rel = buf.t[i] - t0;
+            if (rel < 0) continue;
+            s.x.push_back(rel);
+            s.y.push_back(buf.v[i]);
+        }
+        if (!s.x.empty()) all.push_back(std::move(s));
+    }
+    if (all.empty()) return;
+    if (ImPlot::BeginPlot(title, ImVec2(-1, 130), ImPlotFlags_NoTitle)) {
+        ImPlot::SetupAxes("Time (s)", "Value", ImPlotAxisFlags_NoTickLabels, ImPlotAxisFlags_AutoFit);
+        ImPlot::SetupAxisLimits(ImAxis_X1, 0, window, ImGuiCond_Always);
+        double y_lo = (double)y_min, y_hi = (double)y_max;
+        bool zero_one = (y_min == 0.0f && y_max == 1.0f);
+        bool neg1_pos1 = (y_min == -1.0f && y_max == 1.0f);
+        if (zero_one) { y_lo = -0.05; y_hi = 1.05; }
+        else if (neg1_pos1) { y_lo = -1.05; y_hi = 1.05; }
+        ImPlot::SetupAxisLimits(ImAxis_Y1, y_lo, y_hi, ImGuiCond_Always);
+        if (zero_one) {
+            static double ticks[] = {0.0, 0.5, 1.0};
+            static const char* labels[] = {"0", "0.5", "1.0"};
+            ImPlot::SetupAxisTicks(ImAxis_Y1, ticks, 3, labels);
+        } else if (neg1_pos1) {
+            static double ticks[] = {-1.0, 0.0, 1.0};
+            static const char* labels[] = {"-1", "0", "1"};
+            ImPlot::SetupAxisTicks(ImAxis_Y1, ticks, 3, labels);
+        }
+        for (auto &s : all) {
+            ImPlot::PlotLine(s.name, s.x.data(), s.y.data(), (int)s.x.size());
+        }
+        ImPlot::EndPlot();
+    }
+}
 
 struct FilterSettings {
     bool enabled = false;
@@ -117,8 +189,32 @@ static void SaveFilterSettings(const char* path, const FilterSettings& fs) {
     }
 }
 
+static void SaveHotasFilterModes(const char* path,
+                                 const std::vector<HotasReader::SignalDescriptor>& sigs,
+                                 const std::unordered_map<std::string,int>& hotas_modes) {
+    // Append/update per-signal modes for HOTAS signals at the end of the cfg.
+    // Simple approach: append lines; loader uses last occurrence effectively.
+    std::ofstream out(path, std::ios::out | std::ios::app);
+    if (!out) return;
+    for (const auto& sd : sigs) {
+        int mode = 0;
+        const char* devp = (sd.device == HotasReader::SignalDescriptor::DeviceKind::Stick) ? "stick" : "throttle";
+        std::string map_key = std::string(devp) + ":" + sd.id;
+        auto it = hotas_modes.find(map_key);
+        if (it != hotas_modes.end()) mode = it->second;
+        // Write device-prefixed key to disambiguate duplicates (legacy reader falls back if this is absent)
+        out << "filter_" << devp << "_" << sd.name << "=";
+        switch (mode) {
+            case 1: out << "digital\n"; break;
+            case 2: out << "analog\n"; break;
+            default: out << "none\n"; break;
+        }
+    }
+}
+
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "d2d1.lib")
 
 // ImGui Win32 + DX11 backend forward decls
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -129,6 +225,8 @@ static IDXGISwapChain*          g_pSwapChain = nullptr;
 static ID3D11RenderTargetView*  g_mainRenderTargetView = nullptr;
 static ID3D11ShaderResourceView* g_backgroundSRV = nullptr;
 static int g_bg_width = 0, g_bg_height = 0;
+static ID3D11ShaderResourceView* g_keyboardSRV = nullptr;
+static int g_kb_width = 0, g_kb_height = 0;
 
 static bool LoadTextureWIC(const wchar_t* filename, ID3D11Device* device, ID3D11DeviceContext* context,
                            ID3D11ShaderResourceView** out_srv, int* out_width, int* out_height) {
@@ -155,22 +253,94 @@ static bool LoadTextureWIC(const wchar_t* filename, ID3D11Device* device, ID3D11
     if (FAILED(hr)) { converter->Release(); frame->Release(); decoder->Release(); factory->Release(); return false; }
     converter->Release(); frame->Release(); decoder->Release(); factory->Release();
 
+    // Create texture with auto-generated mipmaps for crisp downscaling
     D3D11_TEXTURE2D_DESC texDesc{};
-    texDesc.Width = w; texDesc.Height = h; texDesc.MipLevels = 1; texDesc.ArraySize = 1;
+    texDesc.Width = w; texDesc.Height = h; texDesc.MipLevels = 0; texDesc.ArraySize = 1; // 0 = full mip chain
     texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; texDesc.SampleDesc.Count = 1;
-    texDesc.Usage = D3D11_USAGE_IMMUTABLE; texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    D3D11_SUBRESOURCE_DATA initData{}; initData.pSysMem = pixels.data(); initData.SysMemPitch = w * 4;
+    texDesc.Usage = D3D11_USAGE_DEFAULT;
+    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    texDesc.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
     ID3D11Texture2D* tex = nullptr;
-    hr = device->CreateTexture2D(&texDesc, &initData, &tex);
+    hr = device->CreateTexture2D(&texDesc, nullptr, &tex);
     if (FAILED(hr) || !tex) return false;
+    // Upload top mip
+    context->UpdateSubresource(tex, 0, nullptr, pixels.data(), w * 4, 0);
+    // Create SRV covering all mips
     D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
-    srvDesc.Format = texDesc.Format; srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; srvDesc.Texture2D.MipLevels = 1;
+    srvDesc.Format = texDesc.Format; srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Texture2D.MostDetailedMip = 0; srvDesc.Texture2D.MipLevels = (UINT)-1; // all mips
     hr = device->CreateShaderResourceView(tex, &srvDesc, out_srv);
+    if (FAILED(hr) || !*out_srv) { tex->Release(); return false; }
+    // Generate mipmaps
+    context->GenerateMips(*out_srv);
     tex->Release();
-    if (FAILED(hr) || !*out_srv) return false;
     if (out_width) *out_width = (int)w; if (out_height) *out_height = (int)h;
     return true;
 }
+
+static std::string WideToUtf8(const wchar_t* wstr) {
+    if (!wstr) return {};
+    int len = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, nullptr, 0, nullptr, nullptr);
+    if (len <= 0) return {};
+    std::string out; out.resize((size_t)len - 1);
+    WideCharToMultiByte(CP_UTF8, 0, wstr, -1, out.data(), len, nullptr, nullptr);
+    return out;
+}
+
+// Load an SVG via Lunasvg and create a mipmapped D3D11 texture (BGRA format)
+static bool LoadTextureSVG_Luna(const wchar_t* filename, ID3D11Device* device, ID3D11DeviceContext* context,
+                                ID3D11ShaderResourceView** out_srv, int* out_width, int* out_height,
+                                int target_px_width, int target_px_height) {
+    if (!device || !context || !filename || !out_srv) return false;
+    *out_srv = nullptr;
+    std::string path = WideToUtf8(filename);
+    auto doc = lunasvg::Document::loadFromFile(path);
+    if (!doc) return false;
+    // Compute output size: prefer explicit target width/height if provided
+    int out_w = target_px_width;
+    int out_h = target_px_height;
+    if (out_w <= 0 || out_h <= 0) {
+        // Fallback: derive aspect ratio from intrinsic size or bounding box
+        float dw = doc->width();
+        float dh = doc->height();
+        if (dw <= 0.f || dh <= 0.f) {
+            auto box = doc->boundingBox();
+            dw = box.w;
+            dh = box.h;
+        }
+        double aspect = (dh > 0.0f) ? (static_cast<double>(dw) / static_cast<double>(dh)) : 1.0;
+        out_h = (out_h > 0) ? out_h : 64;
+        out_w = (out_w > 0) ? out_w : std::max(1, (int)std::floor(out_h * aspect + 0.5));
+    }
+    auto bmp = doc->renderToBitmap(out_w, out_h);
+    if (bmp.isNull()) return false;
+    // Convert to RGBA plain for DXGI_FORMAT_R8G8B8A8_UNORM
+    bmp.convertToRGBA();
+    const unsigned char* data = bmp.data();
+
+    // Create texture with auto-generated mipmaps for crisp downscaling (BGRA)
+    D3D11_TEXTURE2D_DESC texDesc{};
+    texDesc.Width = out_w; texDesc.Height = out_h; texDesc.MipLevels = 0; texDesc.ArraySize = 1;
+    texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; texDesc.SampleDesc.Count = 1;
+    texDesc.Usage = D3D11_USAGE_DEFAULT;
+    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    texDesc.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+    ID3D11Texture2D* tex = nullptr;
+    HRESULT hr = device->CreateTexture2D(&texDesc, nullptr, &tex);
+    if (FAILED(hr) || !tex) return false;
+    context->UpdateSubresource(tex, 0, nullptr, data, bmp.stride(), 0);
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+    srvDesc.Format = texDesc.Format; srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Texture2D.MostDetailedMip = 0; srvDesc.Texture2D.MipLevels = (UINT)-1;
+    hr = device->CreateShaderResourceView(tex, &srvDesc, out_srv);
+    if (FAILED(hr) || !*out_srv) { tex->Release(); return false; }
+    context->GenerateMips(*out_srv);
+    tex->Release();
+    if (out_width) *out_width = out_w; if (out_height) *out_height = out_h;
+    return true;
+}
+// Rasterize an SVG into a texture using Direct2D + WIC, for crisp scaling
+// Removed unused legacy SVG rasterizer stub (replaced by LunaSVG path)
 
 static void CreateRenderTarget() {
     ID3D11Texture2D* pBackBuffer;
@@ -278,6 +448,20 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         if (LoadTextureWIC(path, g_pd3dDevice, g_pd3dDeviceContext, &g_backgroundSRV, &g_bg_width, &g_bg_height)) break;
     }
 
+    // Load keyboard icon strictly from SVG (no PNG/text fallbacks)
+    const wchar_t* kb_svg_candidates[] = {
+        L"graphics\\keyboard.svg",
+        L"..\\graphics\\keyboard.svg",
+        L"..\\..\\graphics\\keyboard.svg",
+        L"res\\graphics\\keyboard.svg",
+        L"..\\res\\graphics\\keyboard.svg",
+        L"..\\..\\res\\graphics\\keyboard.svg"
+    };
+    for (auto* path : kb_svg_candidates) {
+        // Render SVG at fixed 64x36 pixels for crisp display
+        if (LoadTextureSVG_Luna(path, g_pd3dDevice, g_pd3dDeviceContext, &g_keyboardSRV, &g_kb_width, &g_kb_height, 64, 36)) break;
+    }
+
     // Load persisted settings before starting poller (overrides defaults if present)
     FilterSettings filter_settings; LoadFilterSettings("config/filter_settings.cfg", filter_settings);
 
@@ -289,9 +473,43 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     XInputPoller poller; poller.start(0, fixed_polling_hz, g_window_seconds);
     HotasReader hotas;
     HotasMapper hotas_mapper;
+    // Build HOTAS per-signal filter mode map from config (device-scoped keys)
+    // Key format: "stick:<id>" or "throttle:<id>" to disambiguate duplicates (e.g., E/F/G)
+    std::unordered_map<std::string,int> hotas_filter_modes; // 0=none,1=digital,2=analog
+    {
+        std::ifstream in("config/filter_settings.cfg", std::ios::in);
+        if (in) {
+            std::unordered_map<std::string,std::string> kv;
+            std::string line;
+            while (std::getline(in, line)) {
+                if (line.empty() || line[0] == '#') continue;
+                auto pos = line.find('='); if (pos==std::string::npos) continue;
+                kv[line.substr(0,pos)] = line.substr(pos+1);
+            }
+            auto sigs = hotas.list_signals();
+            for (const auto &sd : sigs) {
+                const char* devp = (sd.device == HotasReader::SignalDescriptor::DeviceKind::Stick) ? "stick" : "throttle";
+                std::string dev_key = std::string("filter_") + devp + "_" + sd.name; // new device-scoped key
+                std::string legacy_key = std::string("filter_") + sd.name;             // legacy key without device prefix
+                // Prefer device-scoped key; fall back to legacy
+                std::string key = kv.count(dev_key) ? dev_key : legacy_key;
+                auto it = kv.find(key);
+                int mode = 0;
+                if (it != kv.end()) {
+                    const std::string &v = it->second;
+                    if (v == "digital") mode = 1; else if (v == "analog") mode = 2; else mode = 0;
+                }
+                std::string map_key = std::string(devp) + ":" + sd.id;
+                hotas_filter_modes[map_key] = mode; // track by device+id
+            }
+        }
+    }
     // Load persisted HOTAS mappings at startup
     hotas_mapper.load_profile("config/mappings.json");
-    // Do not inject mapped states back into the poller; forwarder handles output.
+    // Inject mapped controller states back into the poller for plotting/filtering
+    hotas_mapper.set_inject_callback([&](double t, const XInputPoller::ControllerState& cs){
+        poller.inject_state(t, cs);
+    });
     static bool show_hotas_detect_window = false;
     static std::vector<std::string> hotas_detect_lines;
     static bool show_developer_view = false;
@@ -299,17 +517,18 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     static bool show_mappings_window = false;
     static FilteredForwarder forwarder;
     poller.set_sink(&forwarder);
-    bool virtual_enabled = false; // start disabled; will auto-enable after HOTAS detection
+    bool virtual_enabled = g_virtual_output_enabled; // start from persisted setting
+    // Keep forwarder output disabled; HotasMapper will drive ViGEm output based on mappings
     forwarder.enable_output(false);
+    // Start mapper if virtual output persisted enabled
+    if (virtual_enabled) {
+        hotas_mapper.start(1000.0);
+    }
     forwarder.enable_filter(filter_settings.enabled);
     forwarder.set_params(filter_settings.analog_delta, filter_settings.digital_max_ms/1000.0);
     forwarder.set_trigger_modes(filter_settings.left_trigger_digital, filter_settings.right_trigger_digital);
     forwarder.set_filter_modes(filter_settings.per_signal_mode);
     forwarder.set_window_seconds(g_window_seconds);
-    PlotsPanel raw_panel(poller, PlotConfig{g_window_seconds, 4000});
-    raw_panel.set_filter_mode(false);
-    raw_panel.set_filter_thresholds(filter_settings.analog_delta, filter_settings.analog_return, filter_settings.digital_max_ms/1000.0);
-    raw_panel.set_trigger_digital(filter_settings.left_trigger_digital, filter_settings.right_trigger_digital);
     FilterSettings working = filter_settings; // editable working copy
     bool filter_dirty = false;
     // Saved snapshot for window_seconds to participate in dirty tracking
@@ -325,25 +544,141 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         using clock = std::chrono::steady_clock;
         auto last_ok_tp = clock::now();
         auto next_refresh_tp = clock::now();
+        // Per-signal filter state (id -> prev/current)
+        std::unordered_map<std::string,double> prev_vals;
+        std::unordered_map<std::string,double> rise_times;
+        std::unordered_map<std::string,bool> active_flags;
         while (hotas_bg_thread_running.load()) {
             // HOTAS input always enabled
             if (hotas_bg_enabled.load()) {
-                auto snap = hotas.poll_once();
+                // Advance HOTAS timebase to keep raw HID plots rolling
+                (void)hotas.poll_once();
                 auto now_tp = clock::now();
                 // Connection-based liveness: prefer handle visibility over report freshness.
                 bool connected = hotas.has_stick() || hotas.has_throttle();
-                if (snap.ok) {
+                // Pull HID live snapshot and parse per-signal values
+                auto live = hotas.get_hid_live_snapshot();
+                // Convert hex to bytes per device
+                auto hex_to_bytes = [&](const std::string &hex, std::vector<uint8_t> &out) {
+                    out.clear();
+                    auto hexval = [](char c)->int {
+                        if (c >= '0' && c <= '9') return c - '0';
+                        if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+                        if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+                        return 0;
+                    };
+                    for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+                        int hi = hexval(hex[i]), lo = hexval(hex[i+1]);
+                        out.push_back((uint8_t)((hi << 4) | lo));
+                    }
+                };
+                std::vector<uint8_t> stick_bytes;
+                std::vector<uint8_t> throttle_bytes;
+                bool have_stick_report = false;
+                bool have_throttle_report = false;
+                for (auto &p : live) {
+                    const std::string &path = p.first;
+                    const std::string &hex = p.second;
+                    if (hex.empty() || hex == "(no data yet)") continue;
+                    if (path.find("vid_0738&pid_2221") != std::string::npos && path.find("mi_00") != std::string::npos) {
+                        hex_to_bytes(hex, stick_bytes);
+                        have_stick_report = !stick_bytes.empty();
+                    } else if (path.find("vid_0738&pid_a221") != std::string::npos && path.find("mi_00") != std::string::npos) {
+                        hex_to_bytes(hex, throttle_bytes);
+                        have_throttle_report = !throttle_bytes.empty();
+                    }
+                }
+                if (have_stick_report || have_throttle_report) {
                     last_ok_tp = now_tp;
-                    if (!hotas_detected.exchange(true)) {
-                        // First detection; auto-start virtual output
-                        if (!forwarder.output_enabled()) {
-                            forwarder.enable_output(true);
-                        }
-                        output_auto_started.store(true, std::memory_order_release);
+                    hotas_detected.store(true, std::memory_order_release);
+                    // Auto-start mapper on first detection if not already running
+                    static bool mapper_started_auto = false;
+                    if (virtual_enabled && !mapper_started_auto) {
+                        hotas_mapper.start(1000.0);
+                        mapper_started_auto = true;
                     }
                     double now = std::chrono::duration<double>(now_tp.time_since_epoch()).count();
-                    // Inject the raw HOTAS state into the poller pipeline (poller -> filter -> mapper -> output)
-                    poller.inject_state(now, snap.state);
+                    // Build per-signal values using CSV descriptors
+                    auto sigs = hotas.list_signals();
+                    auto extract_bits = [&](const std::vector<uint8_t>& bytes, int bit_start, int bits)->uint64_t {
+                        if (bits <= 0) return 0;
+                        uint64_t val = 0;
+                        for (int i = 0; i < bits; ++i) {
+                            int bit_global = bit_start + i;
+                            size_t byte_idx = (size_t)bit_global / 8;
+                            int bit_in_byte = bit_global % 8; // LSB-first
+                            int bitv = 0;
+                            if (byte_idx < bytes.size()) bitv = (bytes[byte_idx] >> bit_in_byte) & 1;
+                            val |= (uint64_t)bitv << i;
+                        }
+                        return val;
+                    };
+                    for (const auto &sd : sigs) {
+                        const std::vector<uint8_t>& bytes = (sd.device == HotasReader::SignalDescriptor::DeviceKind::Stick) ? stick_bytes : throttle_bytes;
+                        if (bytes.empty()) continue;
+                        uint64_t raw = extract_bits(bytes, sd.bit_start, sd.bits);
+                        double v = 0.0;
+                        // Normalize common analog types
+                        if (sd.id == "joy_x" || sd.id == "joy_y" || sd.id == "joy_z") {
+                            double maxv = (double)((1ULL << sd.bits) - 1);
+                            v = (maxv > 0.0) ? (double)raw / maxv * 2.0 - 1.0 : 0.0;
+                        } else if (sd.id == "c_joy_x" || sd.id == "c_joy_y" || sd.id == "thumb_joy_x" || sd.id == "thumb_joy_y") {
+                            v = ((double)raw / 255.0) * 2.0 - 1.0;
+                        } else if (sd.id == "left_throttle" || sd.id == "right_throttle") {
+                            v = (double)raw / (double)((1ULL << sd.bits) - 1);
+                        } else if (sd.analog) {
+                            v = (double)raw; // other analogs raw 0..(2^bits-1)
+                        } else {
+                            v = (double)raw; // digital/multi-bit raw value
+                        }
+                        // Apply per-signal filtering prior to mapping
+                        int mode = 0;
+                        std::string map_key = std::string(device_prefix(sd.device)) + ":" + sd.id;
+                        auto fm_it = hotas_filter_modes.find(map_key);
+                        if (fm_it != hotas_filter_modes.end()) mode = fm_it->second;
+                        double out_v = v;
+                        if (mode == 2) {
+                            // Analog spike suppression
+                            double prev = prev_vals.count(map_key) ? prev_vals[map_key] : v;
+                            double dv = fabs(out_v - prev);
+                            if (dv >= working.analog_delta) out_v = prev;
+                        } else if (mode == 1) {
+                            // Digital debounce/gating: interpret non-analog values >0 as active
+                            bool now_hi = sd.analog ? (out_v >= 0.5) : (out_v > 0.0);
+                            bool prev_hi = active_flags.count(map_key) ? active_flags[map_key] : false;
+                            double &rise = rise_times[map_key];
+                            if (!prev_vals.count(map_key)) rise = -1.0;
+                            if (now_hi && !prev_hi) {
+                                rise = now;
+                                active_flags[map_key] = false;
+                            } else if (now_hi && prev_hi) {
+                                if (!active_flags[map_key] && rise >= 0.0) {
+                                    double dur = now - rise;
+                                    if (dur >= (working.digital_max_ms/1000.0)) active_flags[map_key] = true;
+                                }
+                            } else if (!now_hi && prev_hi) {
+                                active_flags[map_key] = false; rise = -1.0;
+                            } else {
+                                rise = -1.0; active_flags[map_key] = false;
+                            }
+                            out_v = active_flags[map_key] ? 1.0 : 0.0;
+                        }
+                        prev_vals[map_key] = out_v;
+                        hotas_mapper.accept_sample(map_key, out_v, now);
+                        // Store filtered value for UI plots
+                        HidBuf &fb = g_hid_filtered_buffers[std::string(device_prefix(sd.device)) + ":" + sd.name];
+                        fb.t.push_back(now);
+                        fb.v.push_back(out_v);
+                        // Trim to window
+                        double window = g_window_seconds;
+                        double t0 = now - window;
+                        size_t first_keep = 0;
+                        while (first_keep < fb.t.size() && fb.t[first_keep] < t0) ++first_keep;
+                        if (first_keep > 0) {
+                            fb.t.erase(fb.t.begin(), fb.t.begin() + first_keep);
+                            fb.v.erase(fb.v.begin(), fb.v.begin() + first_keep);
+                        }
+                    }
                 } else {
                     // If no valid HOTAS data is arriving, only re-enumerate when devices appear disconnected.
                     if (!connected && (now_tp - last_ok_tp > std::chrono::seconds(1)) && now_tp >= next_refresh_tp) {
@@ -459,12 +794,11 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                 ImGui::DockBuilderRemoveNode(dock_id);            // clear any previous (in case of hot reload)
                 ImGui::DockBuilderAddNode(dock_id, ImGuiDockNodeFlags_DockSpace);
                 ImGui::DockBuilderSetNodeSize(dock_id, viewport->Size);
-                // Create a three-column layout: left (Control), middle (Raw Signals), right (Filtered Signals)
+                // Create a three-column layout: left (Control), middle (Stick/Throttle), right (Filtered Signals)
                 ImGuiID dock_left = ImGui::DockBuilderSplitNode(dock_id, ImGuiDir_Left, 0.22f, nullptr, &dock_id); // 22% left panel
                 ImGuiID dock_right = ImGui::DockBuilderSplitNode(dock_id, ImGuiDir_Right, 0.33f, nullptr, &dock_id); // 33% right panel
                 ImGuiID dock_main = dock_id; // middle area (remaining)
                 ImGui::DockBuilderDockWindow("Control", dock_left);
-                ImGui::DockBuilderDockWindow("Raw Signals", dock_main);
                 ImGui::DockBuilderDockWindow("Stick", dock_main);
                 ImGui::DockBuilderDockWindow("Throttle", dock_main);
                 ImGui::DockBuilderDockWindow("Filtered Signals", dock_right);
@@ -492,22 +826,18 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         ImGui::Begin("Control", nullptr, ImGuiWindowFlags_NoBackground);
         auto stats = poller.stats();
         ImGui::Text("Effective Hz: %.1f", stats.effective_hz);
-        // Sync UI checkbox with backend state
-        virtual_enabled = forwarder.output_enabled();
-        // Virtual controller output toggle
+        // Virtual controller output toggle (driven by HotasMapper)
         if (ImGui::Checkbox("Virtual Output", &virtual_enabled)) {
-            // Try to enable/disable; backend will init on demand
-            forwarder.enable_output(virtual_enabled);
-            if (forwarder.output_enabled()) {
+            if (virtual_enabled) {
+                hotas_mapper.start(1000.0);
                 g_virtual_output_enabled = true;
-                virtual_enabled = true;
             } else {
+                hotas_mapper.stop();
                 g_virtual_output_enabled = false;
-                virtual_enabled = false;
             }
         }
-        ImGui::SameLine(); ImGui::TextDisabled(forwarder.backend_status());
-        ImGui::Text("Backend: %s | Output: %s", forwarder.backend_status(), forwarder.output_enabled() ? "On" : "Off");
+        ImGui::SameLine(); ImGui::TextDisabled("Mapper");
+        ImGui::Text("Backend: %s | Output: %s", "ViGEm (HotasMapper)", virtual_enabled ? "On" : "Off");
         // Controller selection (0-3)
         static int controller_idx = 0;
         controller_idx = poller.controller_index();
@@ -527,15 +857,6 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         ImGui::SetItemTooltip("Pick the physical controller. Auto Detect chooses the first connected (could be the emulated one if enabled).");
         // HOTAS input is always enabled; no toggle displayed.
 
-        if (virtual_enabled) {
-            const char* upd = forwarder.last_update_status();
-            if (upd && *upd) { ImGui::TextColored(ImVec4(1,0.2f,0.2f,1), "Last Update: %s", upd); }
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Test Pulse")) {
-                forwarder.trigger_test_pulse();
-            }
-            ImGui::SetItemTooltip("Injects a synthetic full-press state (ABXY+Shoulders, full sticks/triggers) once");
-        }
         if (stats.avg_loop_us > 0.0) {
             ImGui::Text("Avg loop: %.2f us", stats.avg_loop_us);
         }
@@ -548,11 +869,10 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             ImGui::Text("HOTAS Throttle: %s", throttle_conn ? "Connected" : "Not Connected");
         }
         // Window length controls (1 - 60 seconds)
-        double win = raw_panel.window_seconds();
+        double win = g_window_seconds;
         double win_min = 1.0, win_max = 60.0;
         if (ImGui::SliderScalar("Window (s)", ImGuiDataType_Double, &win, &win_min, &win_max, "%.0f")) {
             poller.set_window_seconds(win);
-            raw_panel.set_window_seconds(win);
             forwarder.set_window_seconds(win);
             g_window_seconds = win;
         }
@@ -560,7 +880,6 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         if (ImGui::InputDouble("Window Exact", &win, 0.1, 1.0, "%.1f")) {
             if (win < 1.0) win = 1.0; else if (win > 60.0) win = 60.0;
             poller.set_window_seconds(win);
-            raw_panel.set_window_seconds(win);
             forwarder.set_window_seconds(win);
             g_window_seconds = win;
         }
@@ -573,7 +892,6 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         double digital_max = working.digital_max_ms;
         if (ImGui::CollapsingHeader("Filter Mode", ImGuiTreeNodeFlags_DefaultOpen)) {
             if (ImGui::Checkbox("Enable Filter Mode", &filter_mode)) {
-                raw_panel.set_filter_mode(false);
                 working.enabled = filter_mode;
                 filter_dirty = true;
                 forwarder.enable_filter(filter_mode);
@@ -588,18 +906,15 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                 bool rt_dig = working.right_trigger_digital;
                 if (ImGui::Checkbox("Left Trigger Digital", &lt_dig)) {
                     working.left_trigger_digital = lt_dig;
-                    raw_panel.set_trigger_digital(lt_dig, working.right_trigger_digital);
                     forwarder.set_trigger_modes(lt_dig, working.right_trigger_digital);
                     filter_dirty = true;
                 }
                 if (ImGui::Checkbox("Right Trigger Digital", &rt_dig)) {
                     working.right_trigger_digital = rt_dig;
-                    raw_panel.set_trigger_digital(working.left_trigger_digital, rt_dig);
                     forwarder.set_trigger_modes(working.left_trigger_digital, rt_dig);
                     filter_dirty = true;
                 }
                 if (updated) {
-                    raw_panel.set_filter_thresholds(analog_delta, analog_return, digital_max/1000.0);
                     working.analog_delta = analog_delta;
                     working.analog_return = analog_return;
                     working.digital_max_ms = digital_max;
@@ -607,72 +922,28 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                     forwarder.set_params(analog_delta, digital_max/1000.0);
                 }
                 
-                ImGui::SeparatorText("Per-Input Filter Modes");
-                ImGui::TextDisabled("Select filter mode for each input: None (raw), Digital (debounce), or Analog (spike suppress).");
-                // Color table (repeatable palette)
-                static ImVec4 cols[] = {
-                    {0.86f,0.58f,0.24f,1},{0.30f,0.75f,0.93f,1},{0.50f,0.70f,0.30f,1},{0.90f,0.30f,0.30f,1},
-                    {0.70f,0.50f,0.90f,1},{0.95f,0.80f,0.30f,1},{0.40f,0.85f,0.60f,1},{0.80f,0.40f,0.80f,1}
-                };
-                auto draw_mode_selector = [&](Signal sig, const char* label){
-                    size_t idx = (size_t)sig;
-                    ImGui::PushStyleColor(ImGuiCol_Text, cols[idx % IM_ARRAYSIZE(cols)]);
-                    int mode = working.per_signal_mode[idx];
-                    ImGui::TextUnformatted(label);
-                    ImGui::SameLine();
-                    ImGui::SetNextItemWidth(100);
-                    const char* items[] = { "None", "Digital", "Analog" };
-                    if (ImGui::Combo(("##mode_" + std::to_string(idx)).c_str(), &mode, items, IM_ARRAYSIZE(items))) {
-                        working.per_signal_mode[idx] = mode; 
-                        filter_dirty = true;
-                        forwarder.set_filter_modes(working.per_signal_mode);
+                ImGui::SeparatorText("HOTAS Per-Input Filter Modes");
+                ImGui::TextDisabled("Select per-signal mode: None (raw), Digital (debounce), Analog (spike suppression).");
+                const char* items[] = { "None", "Digital", "Analog" };
+                if (ImGui::BeginTable("hotas_filter_modes", 2, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
+                    ImGui::TableSetupColumn("Signal");
+                    ImGui::TableSetupColumn("Mode");
+                    auto sigs = hotas.list_signals();
+                    for (const auto &sd : sigs) {
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        const char* dev = (sd.device == HotasReader::SignalDescriptor::DeviceKind::Stick) ? "Stick" : "Throttle";
+                        std::string disp = std::string(dev) + ": " + sd.name;
+                        ImGui::TextUnformatted(disp.c_str());
+                        ImGui::TableSetColumnIndex(1);
+                        std::string map_key = std::string((sd.device == HotasReader::SignalDescriptor::DeviceKind::Stick) ? "stick" : "throttle") + ":" + sd.id;
+                        int mode = 0; auto it = hotas_filter_modes.find(map_key); if (it != hotas_filter_modes.end()) mode = it->second;
+                        ImGui::SetNextItemWidth(120);
+                        if (ImGui::Combo((std::string("##hotas_mode_") + map_key).c_str(), &mode, items, IM_ARRAYSIZE(items))) {
+                            hotas_filter_modes[map_key] = mode;
+                            filter_dirty = true;
+                        }
                     }
-                    ImGui::PopStyleColor();
-                };
-                // Grouped layout - explicitly define columns to avoid collapsing one column when narrow
-                if (ImGui::BeginTable("filter_modes", 2, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg)) {
-                    ImGui::TableSetupColumn("Signals1");
-                    ImGui::TableSetupColumn("Signals2");
-                    // First row: sticks
-                    ImGui::TableNextRow();
-                    ImGui::TableSetColumnIndex(0); draw_mode_selector(Signal::LeftX, "Left Stick X");
-                    ImGui::TableSetColumnIndex(1); draw_mode_selector(Signal::RightX, "Right Stick X");
-                    // Second row: more sticks
-                    ImGui::TableNextRow();
-                    ImGui::TableSetColumnIndex(0); draw_mode_selector(Signal::LeftY, "Left Stick Y");
-                    ImGui::TableSetColumnIndex(1); draw_mode_selector(Signal::RightY, "Right Stick Y");
-                    // Third row: triggers & shoulders
-                    ImGui::TableNextRow();
-                    ImGui::TableSetColumnIndex(0); draw_mode_selector(Signal::LeftTrigger, "Left Trigger");
-                    ImGui::TableSetColumnIndex(1); draw_mode_selector(Signal::RightTrigger, "Right Trigger");
-                    // Fourth row: shoulders
-                    ImGui::TableNextRow();
-                    ImGui::TableSetColumnIndex(0); draw_mode_selector(Signal::LeftShoulder, "Left Shoulder");
-                    ImGui::TableSetColumnIndex(1); draw_mode_selector(Signal::RightShoulder, "Right Shoulder");
-                    // Fifth row: face buttons
-                    ImGui::TableNextRow();
-                    ImGui::TableSetColumnIndex(0); draw_mode_selector(Signal::A, "Face Button A");
-                    ImGui::TableSetColumnIndex(1); draw_mode_selector(Signal::B, "Face Button B");
-                    // Sixth row: more face
-                    ImGui::TableNextRow();
-                    ImGui::TableSetColumnIndex(0); draw_mode_selector(Signal::X, "Face Button X");
-                    ImGui::TableSetColumnIndex(1); draw_mode_selector(Signal::Y, "Face Button Y");
-                    // Seventh row: system
-                    ImGui::TableNextRow();
-                    ImGui::TableSetColumnIndex(0); draw_mode_selector(Signal::StartBtn, "Start / Menu");
-                    ImGui::TableSetColumnIndex(1); draw_mode_selector(Signal::BackBtn, "Back / View");
-                    // Eighth row: thumb buttons
-                    ImGui::TableNextRow();
-                    ImGui::TableSetColumnIndex(0); draw_mode_selector(Signal::LeftThumbBtn, "Left Thumb (L3)");
-                    ImGui::TableSetColumnIndex(1); draw_mode_selector(Signal::RightThumbBtn, "Right Thumb (R3)");
-                    // Ninth row: d-pad
-                    ImGui::TableNextRow();
-                    ImGui::TableSetColumnIndex(0); draw_mode_selector(Signal::DPadUp, "D-Pad Up");
-                    ImGui::TableSetColumnIndex(1); draw_mode_selector(Signal::DPadDown, "D-Pad Down");
-                    // Tenth row: more d-pad
-                    ImGui::TableNextRow();
-                    ImGui::TableSetColumnIndex(0); draw_mode_selector(Signal::DPadLeft, "D-Pad Left");
-                    ImGui::TableSetColumnIndex(1); draw_mode_selector(Signal::DPadRight, "D-Pad Right");
                     ImGui::EndTable();
                 }
 
@@ -693,10 +964,10 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                             filter_settings = working;
                             forwarder.set_filter_modes(filter_settings.per_signal_mode);
                             forwarder.set_trigger_modes(filter_settings.left_trigger_digital, filter_settings.right_trigger_digital);
-                            raw_panel.set_trigger_digital(filter_settings.left_trigger_digital, filter_settings.right_trigger_digital);
                         }
-                        // Persist current runtime + filter settings
+                        // Persist current runtime + filter settings and HOTAS per-signal modes
                         SaveFilterSettings("config/filter_settings.cfg", filter_settings);
+                        SaveHotasFilterModes("config/filter_settings.cfg", hotas.list_signals(), hotas_filter_modes);
                         // Update snapshots
                         saved_window_seconds = g_window_seconds;
                         filter_dirty = false;
@@ -707,20 +978,13 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                     if (any_dirty) {
                         if (filter_dirty) {
                             working = filter_settings;
-                            raw_panel.set_filter_mode(false);
-                            raw_panel.set_filter_thresholds(
-                                working.analog_delta,
-                                working.analog_return,
-                                working.digital_max_ms/1000.0);
+                            // Apply persisted settings to forwarder
                             forwarder.enable_filter(working.enabled);
-                            forwarder.set_params(
-                                working.analog_delta,
-                                working.digital_max_ms/1000.0);
+                            forwarder.set_params(working.analog_delta, working.digital_max_ms/1000.0);
                         }
                         if (runtime_dirty) {
                             g_window_seconds = saved_window_seconds;
                             poller.set_window_seconds(g_window_seconds);
-                            raw_panel.set_window_seconds(g_window_seconds);
                             forwarder.set_window_seconds(g_window_seconds);
                         }
                         filter_dirty = false;
@@ -788,33 +1052,29 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             ImGui::Combo("Device", &device_sel, device_names, IM_ARRAYSIZE(device_names));
             ImGui::SetItemTooltip("Filter HOTAS signals by device: All (all signals), Stick (joystick inputs), or Throttle (throttle/quadrant inputs)");
 
-            // Build signal list from HotasReader signals and apply simple device filter
+            // Build signal list from HotasReader signals filtered by DeviceKind
             auto sigs = hotas.list_signals();
-            std::vector<std::string> sig_ids; sig_ids.reserve(sigs.size());
-            for (auto &sd : sigs) {
-                bool include = false;
-                if (device_sel == 0) include = true;
-                else if (device_sel == 1) { // Stick heuristics: name contains JOY or common stick buttons
-                    std::string nm = sd.name;
-                    for (auto &c : nm) c = (char)toupper((unsigned char)c);
-                    if (nm.find("JOY") != std::string::npos) include = true;
-                    if (nm == "TRIGGER" || nm == "BTN_A" || nm == "BTN_B" || nm == "C" ) include = true;
-                } else if (device_sel == 2) { // Throttle heuristics: name contains THR or TRIGGER
-                    std::string nm = sd.name;
-                    for (auto &c : nm) c = (char)toupper((unsigned char)c);
-                    if (nm.find("THR") != std::string::npos || nm.find("THROTTLE") != std::string::npos) include = true;
-                    if (nm.find("TRIGGER") != std::string::npos) include = true; // triggers may live on throttle
-                }
-                if (include) sig_ids.push_back(sd.id);
+            struct SigChoice { std::string id; std::string display; };
+            std::vector<SigChoice> sig_choices; sig_choices.reserve(sigs.size());
+            for (const auto &sd : sigs) {
+                bool include = (device_sel == 0) ||
+                               (device_sel == 1 && sd.device == HotasReader::SignalDescriptor::DeviceKind::Stick) ||
+                               (device_sel == 2 && sd.device == HotasReader::SignalDescriptor::DeviceKind::Throttle);
+                if (!include) continue;
+                SigChoice ch; ch.id = sd.id; ch.display = sd.name + std::string(" (") + sd.id + ")";
+                sig_choices.push_back(std::move(ch));
             }
-            if (sig_ids.empty()) {
-                // fallback to all known signals
-                for (auto &sd : sigs) sig_ids.push_back(sd.id);
+            if (sig_choices.empty()) {
+                for (const auto &sd : sigs) {
+                    SigChoice ch; ch.id = std::string(device_prefix(sd.device)) + ":" + sd.id; ch.display = sd.name + std::string(" (") + sd.id + ")";
+                    sig_choices.push_back(std::move(ch));
+                }
             }
 
             static int sig_sel = 0;
-            std::vector<const char*> sig_items; sig_items.reserve(sig_ids.size());
-            for (auto &s : sig_ids) sig_items.push_back(s.c_str());
+            if (sig_sel >= (int)sig_choices.size()) sig_sel = 0;
+            std::vector<const char*> sig_items; sig_items.reserve(sig_choices.size());
+            for (auto &ch : sig_choices) sig_items.push_back(ch.display.c_str());
 
             ImGui::InputText("Mapping ID", new_id, sizeof(new_id));
             ImGui::SetItemTooltip("Unique identifier for this mapping (e.g., 'm1', 'stick_x_axis'). Used to manage and remove mappings.");
@@ -850,24 +1110,99 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             static int x360_sel = 0;
             static char keyboard_action[64] = "";
             static char mouse_action[64] = "";
-            static double new_param = 1.0;
             if (action_type_sel == 0) {
                 ImGui::Combo("X360 Input", &x360_sel, x360_labels, IM_ARRAYSIZE(x360_labels));
                 ImGui::SetItemTooltip("Select the target Xbox 360 input: axes (sticks, triggers) or buttons (A/B/X/Y, shoulders, DPad, thumb presses, etc.)");
             } else if (action_type_sel == 1) {
+                // Place the picker button before the text field so it stays visible in narrow panes
+                {
+                    if (g_keyboardSRV) {
+                        // Display at the exact loaded size for pixel-perfect rendering
+                        ImVec2 sz((float)g_kb_width, (float)g_kb_height);
+                        bool clicked = ImGui::ImageButton((void*)g_keyboardSRV, sz);
+                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Pick from visual keyboard");
+                        if (clicked) ImGui::OpenPopup("Select Keyboard Key");
+                    } else {
+                        // No fallback: keep layout spacing without a functional control
+                        ImGui::Dummy(ImVec2(24, 24));
+                    }
+                }
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(140.0f);
                 ImGui::InputText("Keyboard (e.g. VK_SPACE or 'A')", keyboard_action, sizeof(keyboard_action));
-                ImGui::SetItemTooltip("Enter a keyboard key code (VK_* constant) or a single character (e.g., 'VK_SPACE', 'A', 'Enter'). Check Windows virtual key codes for reference.");
+                ImGui::SetItemTooltip("Enter a keyboard key code (VK_* constant) or pick from the visual keyboard.");
+                if (ImGui::BeginPopupModal("Select Keyboard Key", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+                    // Simple US keyboard layout for selection
+                    struct KeySpec { const char* label; const char* code; float w; };
+                    auto key_button = [&](const KeySpec &k){
+                        ImGui::PushID(k.code);
+                        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6,6));
+                        ImGui::PushItemWidth(k.w);
+                        bool clicked = ImGui::Button(k.label, ImVec2(k.w, 32));
+                        ImGui::PopItemWidth();
+                        ImGui::PopStyleVar();
+                        ImGui::PopID();
+                        if (clicked) {
+                            strncpy(keyboard_action, k.code, sizeof(keyboard_action)-1);
+                            keyboard_action[sizeof(keyboard_action)-1] = '\0';
+                            ImGui::CloseCurrentPopup();
+                        }
+                    };
+                    // Function row
+                    KeySpec frow[] = {
+                        {"Esc","VK_ESCAPE",50}, {"F1","VK_F1",40},{"F2","VK_F2",40},{"F3","VK_F3",40},{"F4","VK_F4",40},
+                        {"F5","VK_F5",40},{"F6","VK_F6",40},{"F7","VK_F7",40},{"F8","VK_F8",40},
+                        {"F9","VK_F9",40},{"F10","VK_F10",40},{"F11","VK_F11",40},{"F12","VK_F12",40}
+                    };
+                    for (int i=0;i<IM_ARRAYSIZE(frow);++i){ key_button(frow[i]); ImGui::SameLine(); }
+                    ImGui::NewLine();
+                    // Number row
+                    KeySpec numrow[] = {
+                        {"`","VK_OEM_3",40},{"1","1",40},{"2","2",40},{"3","3",40},{"4","4",40},{"5","5",40},{"6","6",40},{"7","7",40},{"8","8",40},{"9","9",40},{"0","0",40},{"-","VK_OEM_MINUS",40},{"=","VK_OEM_PLUS",40},{"Back","VK_BACK",80}
+                    };
+                    for (int i=0;i<IM_ARRAYSIZE(numrow);++i){ key_button(numrow[i]); ImGui::SameLine(); }
+                    ImGui::NewLine();
+                    // Q row
+                    KeySpec qrow[] = {
+                        {"Tab","VK_TAB",70},{"Q","Q",40},{"W","W",40},{"E","E",40},{"R","R",40},{"T","T",40},{"Y","Y",40},{"U","U",40},{"I","I",40},{"O","O",40},{"P","P",40},{"[","VK_OEM_4",40},{"]","VK_OEM_6",40},{"\\","VK_OEM_5",70}
+                    };
+                    for (int i=0;i<IM_ARRAYSIZE(qrow);++i){ key_button(qrow[i]); ImGui::SameLine(); }
+                    ImGui::NewLine();
+                    // A row
+                    KeySpec arow[] = {
+                        {"Caps","VK_CAPITAL",80},{"A","A",40},{"S","S",40},{"D","D",40},{"F","F",40},{"G","G",40},{"H","H",40},{"J","J",40},{"K","K",40},{"L","L",40},{";","VK_OEM_1",40},{"'","VK_OEM_7",40},{"Enter","VK_RETURN",100}
+                    };
+                    for (int i=0;i<IM_ARRAYSIZE(arow);++i){ key_button(arow[i]); ImGui::SameLine(); }
+                    ImGui::NewLine();
+                    // Z row
+                    KeySpec zrow[] = {
+                        {"Shift","VK_SHIFT",90},{"Z","Z",40},{"X","X",40},{"C","C",40},{"V","V",40},{"B","B",40},{"N","N",40},{"M","M",40},{",","VK_OEM_COMMA",40},{".","VK_OEM_PERIOD",40},{"/","VK_OEM_2",40},{"Shift","VK_RSHIFT",90}
+                    };
+                    for (int i=0;i<IM_ARRAYSIZE(zrow);++i){ key_button(zrow[i]); ImGui::SameLine(); }
+                    ImGui::NewLine();
+                    // Bottom row
+                    KeySpec brow[] = {
+                        {"Ctrl","VK_CONTROL",70},{"Win","VK_LWIN",60},{"Alt","VK_MENU",60},{"Space","VK_SPACE",300},{"Alt","VK_RMENU",60},{"Win","VK_RWIN",60},{"Menu","VK_APPS",60},{"Ctrl","VK_RCONTROL",70}
+                    };
+                    for (int i=0;i<IM_ARRAYSIZE(brow);++i){ key_button(brow[i]); ImGui::SameLine(); }
+                    ImGui::NewLine();
+                    // Arrow keys
+                    KeySpec arrows[] = {{"Up","VK_UP",50},{"Left","VK_LEFT",50},{"Down","VK_DOWN",50},{"Right","VK_RIGHT",50}};
+                    for (int i=0;i<IM_ARRAYSIZE(arrows);++i){ key_button(arrows[i]); ImGui::SameLine(); }
+                    ImGui::NewLine();
+                    ImGui::Separator();
+                    if (ImGui::Button("Close")) ImGui::CloseCurrentPopup();
+                    ImGui::EndPopup();
+                }
             } else {
                 ImGui::InputText("Mouse Action (e.g. left_click)", mouse_action, sizeof(mouse_action));
                 ImGui::SetItemTooltip("Enter a mouse action: left_click, right_click, move_up, move_down, scroll_up, scroll_down, etc.");
             }
-            ImGui::InputDouble("Param", &new_param, 0.1, 1.0, "%.3f");
-            ImGui::SetItemTooltip("Optional parameter for the action (scale, deadzone, etc.). Default is 1.0. Interpretations depend on the action type.");
             if (ImGui::Button("Add Mapping")) {
                 MappingEntry e;
                 e.id = std::string(new_id);
                 // selected signal id
-                if (!sig_ids.empty()) e.signal_id = sig_ids[sig_sel]; else e.signal_id = std::string("");
+                if (!sig_choices.empty()) e.signal_id = sig_choices[sig_sel].id; else e.signal_id = std::string("");
                 if (action_type_sel == 0) {
                     e.action = std::string(x360_actions[x360_sel]);
                 } else if (action_type_sel == 1) {
@@ -875,7 +1210,6 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                 } else {
                     e.action = std::string("mouse:") + mouse_action;
                 }
-                e.param = new_param;
                 if (!hotas_mapper.add_mapping(e)) {
                     ImGui::TextColored(ImVec4(1,0.2f,0.2f,1), "Add failed: id exists");
                 }
@@ -885,11 +1219,10 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
             // Show table of mappings
             auto entries = hotas_mapper.list_mapping_entries();
-            if (ImGui::BeginTable("mappings_table", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders)) {
+            if (ImGui::BeginTable("mappings_table", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders)) {
                 ImGui::TableSetupColumn("ID");
                 ImGui::TableSetupColumn("Signal");
                 ImGui::TableSetupColumn("Action");
-                ImGui::TableSetupColumn("Param");
                 ImGui::TableHeadersRow();
                 for (size_t i = 0; i < entries.size(); ++i) {
                     const auto &me = entries[i];
@@ -897,7 +1230,6 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                     ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(me.id.c_str());
                     ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(me.signal_id.c_str());
                     ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(me.action.c_str());
-                    ImGui::TableSetColumnIndex(3); ImGui::Text("%.3f", me.param);
                     // Remove button per row
                     ImGui::TableNextRow();
                     ImGui::TableSetColumnIndex(0);
@@ -909,11 +1241,6 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             }
             ImGui::End();
         }
-
-        ImGui::Begin("Raw Signals", nullptr, ImGuiWindowFlags_NoBackground);
-        raw_panel.draw();
-        ImGui::End();
-
         // Stick window: parse HID live hex and show raw integer graphs for stick inputs
         ImGui::Begin("Stick", nullptr, ImGuiWindowFlags_NoBackground);
         // Build maps dynamically from HotasReader::list_signals() (CSV-driven)
@@ -929,9 +1256,7 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             }
         }
 
-        // Per-signal sample buffers
-        struct Buf { std::vector<double> t, v; };
-        static std::unordered_map<std::string, Buf> g_hid_buffers;
+        // Per-signal sample buffers (shared)
 
         // Helper: parse hex string to bytes
         auto hex_to_bytes = [&](const std::string &hex, std::vector<uint8_t> &out) {
@@ -971,11 +1296,9 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         if (!have_stick_report && !have_throttle_report) {
             ImGui::TextDisabled("No HID stick/throttle reports available yet.");
         } else {
-            double window = raw_panel.window_seconds();
+            double window = g_window_seconds;
             double t0 = now_ts - window;
-
-            std::unordered_map<std::string,double> logical_vals;
-            auto extract_and_store = [&](const std::vector<HidInputMap>& maps, const std::vector<uint8_t>& bytes) {
+            auto extract_and_store = [&](const std::vector<HidInputMap>& maps, const std::vector<uint8_t>& bytes, const char* devpref) {
                 if (bytes.empty()) return;
                 for (auto &m : maps) {
                     uint64_t val = 0;
@@ -1016,10 +1339,9 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                         y_min = 0.0; y_max = (double)((1ULL << m.bits) - 1);
                         plotted = (double)val;
                     }
-                    Buf &b = g_hid_buffers[m.name];
+                    HidBuf &b = g_hid_buffers[std::string(devpref) + ":" + m.name];
                     b.t.push_back(now_ts);
                     b.v.push_back(plotted);
-                    logical_vals[mid] = plotted;
                     size_t first_keep = 0;
                     while (first_keep < b.t.size() && b.t[first_keep] < t0) ++first_keep;
                     if (first_keep > 0) {
@@ -1028,131 +1350,64 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                     }
                 }
             };
-            if (have_stick_report) extract_and_store(stick_map, stick_bytes);
-            if (have_throttle_report) extract_and_store(throttle_map, throttle_bytes);
+            if (have_stick_report) extract_and_store(stick_map, stick_bytes, "stick");
+            if (have_throttle_report) extract_and_store(throttle_map, throttle_bytes, "throttle");
 
-                // Build a ControllerState from logical values (for visualization only)
-                XInputPoller::ControllerState cs{};
-                auto getv = [&](const char* k, double def=0.0)->double {
-                    auto it = logical_vals.find(k);
-                    if (it == logical_vals.end()) return def; return it->second;
-                };
-                // Map HOTAS signals to controller axes (best-effort)
-                cs.lx = (float)getv("joy_x", 0.0);
-                cs.ly = (float)getv("joy_y", 0.0);
-                cs.rx = (float)getv("c_joy_x", 0.0);
-                cs.ry = (float)getv("c_joy_y", 0.0);
-                cs.lt = (float)fmax(0.0, getv("trigger", 0.0));
-                cs.rt = 0.0f;
-                // Buttons: set bits when logical value > 0.5
-                WORD btns = 0;
-                if (getv("A", 0.0) > 0.5) btns |= XINPUT_GAMEPAD_A;
-                if (getv("B", 0.0) > 0.5) btns |= XINPUT_GAMEPAD_B;
-                if (getv("D", 0.0) > 0.5) btns |= XINPUT_GAMEPAD_X;
-                if (getv("E", 0.0) > 0.5) btns |= XINPUT_GAMEPAD_Y;
-                cs.buttons = btns;
-                // Do not inject here; background thread handles injection independent of UI focus.
-                
-                // Grouped plots per request
-                auto plot_group = [&](const char* title, const std::vector<std::pair<const char*, const char*>>& series, float y_min, float y_max) {
-                    // Build each series from buffered samples
-                    struct S { std::vector<double> x; std::vector<double> y; const char* name; };
-                    std::vector<S> all;
-                    for (auto &p : series) {
-                        auto it = g_hid_buffers.find(p.first);
-                        if (it == g_hid_buffers.end()) continue;
-                        const Buf &buf = it->second;
-                        S s; s.name = p.second;
-                        s.x.reserve(buf.t.size());
-                        s.y.reserve(buf.v.size());
-                        for (size_t i = 0; i < buf.t.size(); ++i) {
-                            double rel = buf.t[i] - t0;
-                            if (rel < 0) continue;
-                            s.x.push_back(rel);
-                            s.y.push_back(buf.v[i]);
-                        }
-                        if (!s.x.empty()) all.push_back(std::move(s));
-                    }
-                    if (all.empty()) return;
-                    if (ImPlot::BeginPlot(title, ImVec2(-1, 130), ImPlotFlags_NoTitle)) {
-                        ImPlot::SetupAxes("Time (s)", "Value", ImPlotAxisFlags_NoTickLabels, ImPlotAxisFlags_AutoFit);
-                        ImPlot::SetupAxisLimits(ImAxis_X1, 0, window, ImGuiCond_Always);
-                        ImPlot::SetupAxisLimits(ImAxis_Y1, y_min, y_max, ImGuiCond_Always);
-                        for (auto &s : all) {
-                            ImPlot::PlotLine(s.name, s.x.data(), s.y.data(), (int)s.x.size());
-                        }
-                        ImPlot::EndPlot();
-                    }
-                };
+            // Grouped plots per request (using common PlotHidGroup helper)
 
-                // Joy Stick: JOY_X, JOY_Y, JOY_Z (normalized -1..1)
-                plot_group("Joy Stick", { {"JOY_X","x"}, {"JOY_Y","y"}, {"JOY_Z","z"} }, -1.0f, 1.0f);
-                // C-Joy: C_JOY_X, C_JOY_Y (normalized -1..1)
-                plot_group("C-Joy", { {"C_JOY_X","x"}, {"C_JOY_Y","y"} }, -1.0f, 1.0f);
-                // Triggers: TRIGGER, BTN_E (0..1)
-                plot_group("Triggers", { {"TRIGGER","Trigger"}, {"BTN_E","pinky trigger"} }, 0.0f, 1.0f);
-                // Buttons: BTN_A, BTN_B, C, BTN_D (0..1)
-                plot_group("Buttons", { {"BTN_A","A"}, {"BTN_B","B"}, {"C","C"}, {"BTN_D","D"} }, 0.0f, 1.0f);
-                // POV/Hats on stick: 0..15
-                plot_group("POV", { {"POV","POV"} }, 0.0f, 15.0f);
-                plot_group("H1", { {"H1","H1"} }, 0.0f, 15.0f);
-                plot_group("H2", { {"H2","H2"} }, 0.0f, 15.0f);
-            }
+            // Joy Stick: JOY_X, JOY_Y, JOY_Z (normalized -1..1)
+            PlotHidGroup("Joy Stick", g_hid_buffers, { {"stick:JOY_X","x"}, {"stick:JOY_Y","y"}, {"stick:JOY_Z","z"} }, window, t0, -1.0f, 1.0f);
+            // C-Joy: C_JOY_X, C_JOY_Y (normalized -1..1)
+            PlotHidGroup("C-Joy", g_hid_buffers, { {"stick:C_JOY_X","x"}, {"stick:C_JOY_Y","y"} }, window, t0, -1.0f, 1.0f);
+            // Triggers: TRIGGER, E (0..1)
+            PlotHidGroup("Triggers", g_hid_buffers, { {"stick:TRIGGER","Trigger"}, {"stick:E","pinky trigger"} }, window, t0, 0.0f, 1.0f);
+            // Buttons: A, B, C, D (0..1)
+            PlotHidGroup("Buttons", g_hid_buffers, { {"stick:A","A"}, {"stick:B","B"}, {"stick:C","C"}, {"stick:D","D"} }, window, t0, 0.0f, 1.0f);
+            // POV/Hats on stick: 0..15
+            PlotHidGroup("POV", g_hid_buffers, { {"stick:POV","POV"} }, window, t0, 0.0f, 15.0f);
+            PlotHidGroup("H1", g_hid_buffers, { {"stick:H1","H1"} }, window, t0, 0.0f, 15.0f);
+            PlotHidGroup("H2", g_hid_buffers, { {"stick:H2","H2"} }, window, t0, 0.0f, 15.0f);
+        }
         ImGui::End();
 
         // Throttle window: visualize throttle inputs using previously extracted buffers
         ImGui::Begin("Throttle", nullptr, ImGuiWindowFlags_NoBackground);
         {
-            auto plot_group = [&](const char* title, const std::vector<std::pair<const char*, const char*>>& series, float y_min, float y_max) {
-                double window = raw_panel.window_seconds();
+            // Throttle Quadrant: LEFT/RIGHT_THROTTLE (0..1)
+            {
+                double window = g_window_seconds;
                 double latest = hotas.latest_time();
                 double t0 = latest - window;
-                struct S { std::vector<double> x; std::vector<double> y; const char* name; };
-                std::vector<S> all;
-                for (auto &p : series) {
-                    auto it = g_hid_buffers.find(p.first);
-                    if (it == g_hid_buffers.end()) continue;
-                    const Buf &buf = it->second;
-                    S s; s.name = p.second;
-                    s.x.reserve(buf.t.size());
-                    s.y.reserve(buf.v.size());
-                    for (size_t i = 0; i < buf.t.size(); ++i) {
-                        double rel = buf.t[i] - t0;
-                        if (rel < 0) continue;
-                        s.x.push_back(rel);
-                        s.y.push_back(buf.v[i]);
-                    }
-                    if (!s.x.empty()) all.push_back(std::move(s));
-                }
-                if (all.empty()) return;
-                if (ImPlot::BeginPlot(title, ImVec2(-1, 130), ImPlotFlags_NoTitle)) {
-                    ImPlot::SetupAxes("Time (s)", "Value", ImPlotAxisFlags_NoTickLabels, ImPlotAxisFlags_AutoFit);
-                    ImPlot::SetupAxisLimits(ImAxis_X1, 0, window, ImGuiCond_Always);
-                    ImPlot::SetupAxisLimits(ImAxis_Y1, y_min, y_max, ImGuiCond_Always);
-                    for (auto &s : all) {
-                        ImPlot::PlotLine(s.name, s.x.data(), s.y.data(), (int)s.x.size());
-                    }
-                    ImPlot::EndPlot();
-                }
-            };
-
-            // Throttle Quadrant: LEFT/RIGHT_THROTTLE (0..1)
-            plot_group("Throttle", { {"LEFT_THROTTLE","Left"}, {"RIGHT_THROTTLE","Right"} }, 0.0f, 1.0f);
-            // Throttle Thumb Joystick: THUMB_JOY_X/Y (-1..1)
-            plot_group("Thumb Joystick", { {"THUMB_JOY_X","x"}, {"THUMB_JOY_Y","y"} }, -1.0f, 1.0f);
-            // Throttle Wheels/RTY (0..255)
-            plot_group("Wheels", { {"F_WHEEL","F"}, {"G_WHEEL","G"} }, 0.0f, 255.0f);
-            plot_group("Rotaries", { {"RTY3","RTY3"}, {"RTY4","RTY4"} }, 0.0f, 255.0f);
-            // Throttle Buttons (0..1)
-            plot_group("Throttle Buttons", {
-                {"THUMB_JOY_PRESS","Thumb Press"}, {"E","E"}, {"F","F"}, {"G","G"}, {"H","H"}, {"I","I"},
-                {"K1_UP","K1 Up"}, {"K1_DOWN","K1 Down"}, {"SLIDE","Slide"}, {"SW1","SW1"}, {"SW2","SW2"}, {"SW3","SW3"},
-                {"SW4","SW4"}, {"SW5","SW5"}, {"SW6","SW6"}, {"TGL1_UP","TGL1 Up"}, {"TGL1_DOWN","TGL1 Down"},
-                {"TGL2_UP","TGL2 Up"}, {"TGL2_DOWN","TGL2 Down"}, {"TGL3_UP","TGL3 Up"}, {"TGL3_DOWN","TGL3 Down"},
-                {"TGL4_UP","TGL4 Up"}, {"TGL4_DOWN","TGL4 Down"}, {"M1","M1"}, {"M2","M2"}, {"S1","S1"}
-            }, 0.0f, 1.0f);
-            // Throttle Hats H3/H4 (0..15)
-            plot_group("H3/H4", { {"H3","H3"}, {"H4","H4"} }, 0.0f, 15.0f);
+                PlotHidGroup("Throttle", g_hid_buffers, { {"throttle:LEFT_THROTTLE","Left"}, {"throttle:RIGHT_THROTTLE","Right"} }, window, t0, 0.0f, 1.0f);
+                // Throttle Thumb Joystick: THUMB_JOY_X/Y (-1..1)
+                PlotHidGroup("Thumb Joystick", g_hid_buffers, { {"throttle:THUMB_JOY_X","x"}, {"throttle:THUMB_JOY_Y","y"} }, window, t0, -1.0f, 1.0f);
+                // Throttle Wheels/RTY (0..255)
+                PlotHidGroup("Wheels", g_hid_buffers, { {"throttle:F_WHEEL","F"}, {"throttle:G_WHEEL","G"} }, window, t0, 0.0f, 255.0f);
+                PlotHidGroup("Rotaries", g_hid_buffers, { {"throttle:RTY3","RTY3"}, {"throttle:RTY4","RTY4"} }, window, t0, 0.0f, 255.0f);
+                // Throttle Buttons (0..1) – general buttons (excluding TGL, SW, M1/M2/S1)
+                PlotHidGroup("Throttle Buttons", g_hid_buffers, {
+                    {"throttle:THUMB_JOY_PRESS","Thumb Press"}, {"throttle:E","E"}, {"throttle:F","F"}, {"throttle:G","G"}, {"throttle:H","H"}, {"throttle:I","I"},
+                    {"throttle:K1_UP","K1 Up"}, {"throttle:K1_DOWN","K1 Down"}, {"throttle:SLIDE","Slide"}
+                }, window, t0, 0.0f, 1.0f);
+                // Toggle switches (TGL1..TGL4 up/down)
+                PlotHidGroup("Toggles", g_hid_buffers, {
+                    {"throttle:TGL1_UP","TGL1 Up"}, {"throttle:TGL1_DOWN","TGL1 Down"},
+                    {"throttle:TGL2_UP","TGL2 Up"}, {"throttle:TGL2_DOWN","TGL2 Down"},
+                    {"throttle:TGL3_UP","TGL3 Up"}, {"throttle:TGL3_DOWN","TGL3 Down"},
+                    {"throttle:TGL4_UP","TGL4 Up"}, {"throttle:TGL4_DOWN","TGL4 Down"}
+                }, window, t0, 0.0f, 1.0f);
+                // SW bank (SW1..SW6)
+                PlotHidGroup("Switches", g_hid_buffers, {
+                    {"throttle:SW1","SW1"}, {"throttle:SW2","SW2"}, {"throttle:SW3","SW3"}, {"throttle:SW4","SW4"}, {"throttle:SW5","SW5"}, {"throttle:SW6","SW6"}
+                }, window, t0, 0.0f, 1.0f);
+                // Mode buttons (M1/M2/S1)
+                PlotHidGroup("Mode Buttons", g_hid_buffers, {
+                    {"throttle:M1","M1"}, {"throttle:M2","M2"}, {"throttle:S1","S1"}
+                }, window, t0, 0.0f, 1.0f);
+                // Throttle Hats H3/H4 (0..15)
+                PlotHidGroup("H3/H4", g_hid_buffers, { {"throttle:H3","H3"}, {"throttle:H4","H4"} }, window, t0, 0.0f, 15.0f);
+            }
+            // (throttle plots rendered above via PlotHidGroup)
         }
         ImGui::End();
 
@@ -1267,128 +1522,36 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
         ImGui::Begin("Filtered Signals", nullptr, ImGuiWindowFlags_NoBackground);
         {
-            auto build_step_series = [](const std::vector<Sample>& in,
-                                        double t0,
-                                        double window_end,
-                                        std::vector<double>& x,
-                                        std::vector<double>& y) {
-                x.clear();
-                y.clear();
-                if (in.empty()) return;
-                float current = in.front().v;
-                double prev_t = in.front().t;
-                if (prev_t < t0) prev_t = t0;
-                x.push_back(prev_t - t0);
-                y.push_back(current);
-                for (size_t i = 1; i < in.size(); ++i) {
-                    const auto &s = in[i];
-                    double tt = s.t;
-                    if (tt < t0) continue;
-                    if (s.v == current) continue;
-                    double rel = tt - t0;
-                    x.push_back(rel);
-                    y.push_back(current);
-                    current = s.v;
-                    x.push_back(rel);
-                    y.push_back(current);
-                }
-                if (!x.empty() && x.back() < window_end) {
-                    x.push_back(window_end);
-                    y.push_back(y.back());
-                }
-            };
-            auto plot_analog_group = [&](const char* label,
-                                         std::initializer_list<std::pair<Signal,const char*>> sigs,
-                                         float y_min,
-                                         float y_max) {
-                double latest = forwarder.latest_filtered_time();
-                double w = forwarder.window_seconds();
-                double t0 = latest - w;
-                struct S { std::vector<double> x; std::vector<double> y; const char* name; };
-                std::vector<S> series;
-                std::vector<Sample> tmp;
-                for (auto &p : sigs) {
-                    forwarder.snapshot_filtered(p.first, tmp);
-                    if (tmp.empty()) continue;
-                    S s; s.name = p.second;
-                    s.x.reserve(tmp.size());
-                    s.y.reserve(tmp.size());
-                    for (auto &sm : tmp) {
-                        if (sm.t >= t0) {
-                            s.x.push_back(sm.t - t0);
-                            s.y.push_back(sm.v);
-                        }
-                    }
-                    if (!s.x.empty()) series.push_back(std::move(s));
-                }
-                if (series.empty()) return;
-                if (ImPlot::BeginPlot(label, ImVec2(-1,150), ImPlotFlags_NoTitle)) {
-                    ImPlot::SetupAxes("Time (s)", "Value",
-                                       ImPlotAxisFlags_NoTickLabels,
-                                       ImPlotAxisFlags_AutoFit);
-                    ImPlot::SetupAxisLimits(ImAxis_X1, 0, w, ImGuiCond_Always);
-                    ImPlot::SetupAxisLimits(ImAxis_Y1, y_min, y_max, ImGuiCond_Always);
-                    for (auto &s : series) {
-                        ImPlot::PlotLine(s.name, s.x.data(), s.y.data(), (int)s.x.size());
-                    }
-                    ImPlot::EndPlot();
-                }
-            };
-            auto plot_digital_group = [&](const char* label,
-                                          std::initializer_list<std::pair<Signal,const char*>> sigs) {
-                double latest = forwarder.latest_filtered_time();
-                double w = forwarder.window_seconds();
-                double t0 = latest - w;
-                struct S { std::vector<double> x; std::vector<double> y; const char* name; };
-                std::vector<S> series;
-                std::vector<Sample> tmp;
-                for (auto &p : sigs) {
-                    forwarder.snapshot_filtered_with_baseline(p.first, tmp);
-                    if (tmp.empty()) continue;
-                    S s; s.name = p.second;
-                    build_step_series(tmp, t0, w, s.x, s.y);
-                    if (!s.x.empty()) series.push_back(std::move(s));
-                }
-                if (series.empty()) return;
-                if (ImPlot::BeginPlot(label, ImVec2(-1,150), ImPlotFlags_NoTitle)) {
-                    ImPlot::SetupAxes("Time (s)", "Value",
-                                       ImPlotAxisFlags_NoTickLabels,
-                                       ImPlotAxisFlags_AutoFit);
-                    ImPlot::SetupAxisLimits(ImAxis_X1, 0, w, ImGuiCond_Always);
-                    ImPlot::SetupAxisLimits(ImAxis_Y1, -0.05f, 1.05f, ImGuiCond_Always);
-                    for (auto &s : series) {
-                        ImPlot::PlotLine(s.name, s.x.data(), s.y.data(), (int)s.x.size());
-                    }
-                    ImPlot::EndPlot();
-                }
-            };
-            plot_analog_group(
-                "Left Stick",
-                { {Signal::LeftX,"Left Stick X Axis"}, {Signal::LeftY,"Left Stick Y Axis"} },
-                -1.05f, 1.05f);
-            plot_analog_group(
-                "Right Stick",
-                { {Signal::RightX,"Right Stick X Axis"}, {Signal::RightY,"Right Stick Y Axis"} },
-                -1.05f, 1.05f);
-            plot_analog_group(
-                "Triggers",
-                { {Signal::LeftTrigger,"Left Trigger (LT)"}, {Signal::RightTrigger,"Right Trigger (RT)"} },
-                -0.05f, 1.05f);
-            plot_digital_group(
-                "Shoulder Buttons",
-                { {Signal::LeftShoulder,"Left Shoulder (LB)"}, {Signal::RightShoulder,"Right Shoulder (RB)"} });
-            plot_digital_group(
-                "Face Buttons",
-                { {Signal::A,"Face Button A"}, {Signal::B,"Face Button B"}, {Signal::X,"Face Button X"}, {Signal::Y,"Face Button Y"} });
-            plot_digital_group(
-                "Start/Back",
-                { {Signal::StartBtn,"Start / Menu"}, {Signal::BackBtn,"Back / View"} });
-            plot_digital_group(
-                "Thumbstick Buttons",
-                { {Signal::LeftThumbBtn,"Left Thumbstick (L3)"}, {Signal::RightThumbBtn,"Right Thumbstick (R3)"} });
-            plot_digital_group(
-                "D-Pad",
-                { {Signal::DPadUp,"D-Pad Up"}, {Signal::DPadDown,"D-Pad Down"}, {Signal::DPadLeft,"D-Pad Left"}, {Signal::DPadRight,"D-Pad Right"} });
+            double window = g_window_seconds;
+            double latest = hotas.latest_time();
+            double t0 = latest - window;
+            // Reuse the same groupings as raw Stick/Throttle using filtered buffers
+            PlotHidGroup("Joy Stick (filtered)", g_hid_filtered_buffers, { {"stick:JOY_X","x"}, {"stick:JOY_Y","y"}, {"stick:JOY_Z","z"} }, window, t0, -1.0f, 1.0f);
+            PlotHidGroup("C-Joy (filtered)", g_hid_filtered_buffers, { {"stick:C_JOY_X","x"}, {"stick:C_JOY_Y","y"} }, window, t0, -1.0f, 1.0f);
+            PlotHidGroup("Triggers (filtered)", g_hid_filtered_buffers, { {"stick:TRIGGER","Trigger"}, {"stick:E","pinky trigger"} }, window, t0, 0.0f, 1.0f);
+            PlotHidGroup("Buttons (filtered)", g_hid_filtered_buffers, { {"stick:A","A"}, {"stick:B","B"}, {"stick:C","C"}, {"stick:D","D"} }, window, t0, 0.0f, 1.0f);
+            PlotHidGroup("POV (filtered)", g_hid_filtered_buffers, { {"stick:POV","POV"} }, window, t0, 0.0f, 15.0f);
+            PlotHidGroup("H1 (filtered)", g_hid_filtered_buffers, { {"stick:H1","H1"} }, window, t0, 0.0f, 15.0f);
+            PlotHidGroup("H2 (filtered)", g_hid_filtered_buffers, { {"stick:H2","H2"} }, window, t0, 0.0f, 15.0f);
+            PlotHidGroup("Throttle (filtered)", g_hid_filtered_buffers, { {"throttle:LEFT_THROTTLE","Left"}, {"throttle:RIGHT_THROTTLE","Right"} }, window, t0, 0.0f, 1.0f);
+            PlotHidGroup("Thumb Joystick (filtered)", g_hid_filtered_buffers, { {"throttle:THUMB_JOY_X","x"}, {"throttle:THUMB_JOY_Y","y"} }, window, t0, -1.0f, 1.0f);
+            PlotHidGroup("Wheels (filtered)", g_hid_filtered_buffers, { {"throttle:F_WHEEL","F"}, {"throttle:G_WHEEL","G"} }, window, t0, 0.0f, 255.0f);
+            PlotHidGroup("Rotaries (filtered)", g_hid_filtered_buffers, { {"throttle:RTY3","RTY3"}, {"throttle:RTY4","RTY4"} }, window, t0, 0.0f, 255.0f);
+            PlotHidGroup("Throttle Buttons (filtered)", g_hid_filtered_buffers, {
+                {"throttle:THUMB_JOY_PRESS","Thumb Press"}, {"throttle:E","E"}, {"throttle:F","F"}, {"throttle:G","G"}, {"throttle:H","H"}, {"throttle:I","I"},
+                {"throttle:K1_UP","K1 Up"}, {"throttle:K1_DOWN","K1 Down"}, {"throttle:SLIDE","Slide"}
+            }, window, t0, 0.0f, 1.0f);
+            PlotHidGroup("Toggles (filtered)", g_hid_filtered_buffers, {
+                {"throttle:TGL1_UP","TGL1 Up"}, {"throttle:TGL1_DOWN","TGL1 Down"},
+                {"throttle:TGL2_UP","TGL2 Up"}, {"throttle:TGL2_DOWN","TGL2 Down"},
+                {"throttle:TGL3_UP","TGL3 Up"}, {"throttle:TGL3_DOWN","TGL3 Down"},
+                {"throttle:TGL4_UP","TGL4 Up"}, {"throttle:TGL4_DOWN","TGL4 Down"}
+            }, window, t0, 0.0f, 1.0f);
+            PlotHidGroup("Switches (filtered)", g_hid_filtered_buffers, {
+                {"throttle:SW1","SW1"}, {"throttle:SW2","SW2"}, {"throttle:SW3","SW3"}, {"throttle:SW4","SW4"}, {"throttle:SW5","SW5"}, {"throttle:SW6","SW6"}
+            }, window, t0, 0.0f, 1.0f);
+            PlotHidGroup("Mode Buttons (filtered)", g_hid_filtered_buffers, { {"throttle:M1","M1"}, {"throttle:M2","M2"}, {"throttle:S1","S1"} }, window, t0, 0.0f, 1.0f);
+            PlotHidGroup("H3/H4 (filtered)", g_hid_filtered_buffers, { {"throttle:H3","H3"}, {"throttle:H4","H4"} }, window, t0, 0.0f, 15.0f);
         }
         ImGui::End();
 
@@ -1423,6 +1586,7 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
     CleanupDeviceD3D();
     if (g_backgroundSRV) { g_backgroundSRV->Release(); g_backgroundSRV = nullptr; }
+    if (g_keyboardSRV) { g_keyboardSRV->Release(); g_keyboardSRV = nullptr; }
     CoUninitialize();
     DestroyWindow(hwnd);
     UnregisterClass(wc.lpszClassName, wc.hInstance);

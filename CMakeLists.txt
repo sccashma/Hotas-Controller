@@ -108,7 +108,14 @@ endif()
 
 add_subdirectory(external/ViGEmClient)
 
-target_link_libraries(${PROJECT_NAME} PRIVATE imgui_lib d3d11 dxgi ViGEmClient setupapi Windowscodecs)
+# Require Lunasvg submodule for SVG rendering
+if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/external/lunasvg/CMakeLists.txt)
+    add_subdirectory(external/lunasvg)
+else()
+    message(FATAL_ERROR "Lunasvg submodule not found at external/lunasvg. Initialize submodules: git submodule update --init --recursive")
+endif()
+
+target_link_libraries(${PROJECT_NAME} PRIVATE imgui_lib d3d11 dxgi ViGEmClient setupapi Windowscodecs lunasvg)
 
 target_include_directories(${PROJECT_NAME} PRIVATE external/ViGEmClient/include)
 

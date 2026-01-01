@@ -3,20 +3,32 @@
     {
       "action": "x360:left_x",
       "id": "m1",
-      "param": 1.0,
       "signal_id": "joy_x"
     },
     {
       "action": "x360:left_y",
       "id": "m2",
-      "param": 1.0,
       "signal_id": "joy_y"
     },
     {
-      "action": "x360:right_y",
+      "action": "x360:right_x",
       "id": "m3",
-      "param": 1.0,
-      "signal_id": "left_throttle"
+      "signal_id": "thumb_joy_x"
+    },
+    {
+      "action": "x360:right_y",
+      "id": "m4",
+      "signal_id": "thumb_joy_y"
+    },
+    {
+      "action": "keyboard:v",
+      "id": "m5",
+      "signal_id": "thumb_joy_x"
+    },
+    {
+      "action": "keyboard:v",
+      "id": "m6",
+      "signal_id": "thumb_joy_y"
     }
   ]
 }

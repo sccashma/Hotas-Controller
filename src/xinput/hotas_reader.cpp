@@ -217,7 +217,7 @@ HotasReader::HotasReader() {
             {"H2","H2",66,4,false, SignalDescriptor::DeviceKind::Stick},
             {"left_throttle","LEFT_THROTTLE",8,10,true, SignalDescriptor::DeviceKind::Throttle},
             {"right_throttle","RIGHT_THROTTLE",18,10,true, SignalDescriptor::DeviceKind::Throttle},
-            {"F_wheel","F_WHEEL",67,8,true, SignalDescriptor::DeviceKind::Throttle},
+            {"F_wheel","F_WHEEL",64,8,true, SignalDescriptor::DeviceKind::Throttle},
             {"G_wheel","G_WHEEL",80,8,true, SignalDescriptor::DeviceKind::Throttle},
             {"RTY3","RTY3",104,8,true, SignalDescriptor::DeviceKind::Throttle},
             {"RTY4","RTY4",96,8,true, SignalDescriptor::DeviceKind::Throttle},
@@ -506,53 +506,11 @@ HotasSnapshot HotasReader::poll_once() {
     bool have_stick = !stick_hex.empty() && hex_to_bytes(stick_hex, stick_bytes);
     bool have_throttle = !throttle_hex.empty() && hex_to_bytes(throttle_hex, throttle_bytes);
 
-    XInputPoller::ControllerState cs{}; // zero-initialized
-    bool any_ok = false;
-
-    if (have_stick) {
-        // Map stick HID fields to controller state
-        // JOY_X @ bit 8 (16 bits), JOY_Y @ bit 24 (16 bits)
-        uint64_t joy_x_u = extract_bits_lsb_first(stick_bytes, 8, 16);
-        uint64_t joy_y_u = extract_bits_lsb_first(stick_bytes, 24, 16);
-        // Compact stick axes (8-bit)
-        uint64_t cjoy_x_u = extract_bits_lsb_first(stick_bytes, 80, 8);
-        uint64_t cjoy_y_u = extract_bits_lsb_first(stick_bytes, 88, 8);
-
-        auto norm_u16_to_axis = [](uint64_t v) -> float {
-            double maxv = 65535.0;
-            double f = static_cast<double>(v);
-            return static_cast<float>((f / maxv) * 2.0 - 1.0);
-        };
-        auto norm_u8_to_axis = [](uint64_t v) -> float {
-            double maxv = 255.0;
-            double f = static_cast<double>(v);
-            return static_cast<float>((f / maxv) * 2.0 - 1.0);
-        };
-
-        cs.lx = norm_u16_to_axis(joy_x_u);
-        cs.ly = norm_u16_to_axis(joy_y_u);
-        cs.rx = norm_u8_to_axis(cjoy_x_u);
-        cs.ry = norm_u8_to_axis(cjoy_y_u);
-        // Do not map trigger or buttons here; mapping is user-defined via HotasMapper.
-        cs.lt = 0.0f;
-        cs.rt = 0.0f;
-        cs.buttons = 0;
-
-        any_ok = true;
-    }
-
-    // TODO: Throttle mapping implementation
-    if (have_throttle) {
-        // Implement throttle mapping here.
-    }
-
-    if (any_ok) {
-        snap.ok = true;
-        snap.state = cs;
-    } else {
-        // No parsed HID data available; do not inject a zero-state snapshot.
-        snap.ok = false;
-    }
+    // Hard-coded stick/throttle → ControllerState mapping removed.
+    // This reader only advances time and reports availability; actual mapping is file-driven via HotasMapper.
+    // Report ok if any fresh HID data is present (for liveness), but do not synthesize ControllerState here.
+    bool any_ok = have_stick || have_throttle;
+    snap.ok = any_ok;
 
     return snap;
 }

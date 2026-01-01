@@ -241,12 +241,12 @@ private:
         }
         
         // Apply per-signal analog or digital filtering based on mode
-        auto apply_analog_filter = [&](float &cur, float prev, Signal sig) {
+        auto apply_analog_filter = [&](float &cur, float prev) {
             float dv = fabsf(cur - prev);
             if (dv >= _analog_delta) cur = prev; // spike detected; revert to prev
         };
         
-        auto apply_digital_filter = [&](bool &now, bool prev, int btn_idx, Signal sig) {
+        auto apply_digital_filter = [&](bool &now, bool prev, int btn_idx) {
             double &rise = _rise_time[btn_idx];
             bool &active = _btn_active[btn_idx];
             if (now && !prev) {
@@ -270,19 +270,19 @@ private:
             int mode_ly = _signal_mode[(size_t)Signal::LeftY].load(std::memory_order_acquire);
             int mode_rx = _signal_mode[(size_t)Signal::RightX].load(std::memory_order_acquire);
             int mode_ry = _signal_mode[(size_t)Signal::RightY].load(std::memory_order_acquire);
-            if (mode_lx == 2) apply_analog_filter(cs.lx, _prev.lx, Signal::LeftX);
-            if (mode_ly == 2) apply_analog_filter(cs.ly, _prev.ly, Signal::LeftY);
-            if (mode_rx == 2) apply_analog_filter(cs.rx, _prev.rx, Signal::RightX);
-            if (mode_ry == 2) apply_analog_filter(cs.ry, _prev.ry, Signal::RightY);
+            if (mode_lx == 2) apply_analog_filter(cs.lx, _prev.lx);
+            if (mode_ly == 2) apply_analog_filter(cs.ly, _prev.ly);
+            if (mode_rx == 2) apply_analog_filter(cs.rx, _prev.rx);
+            if (mode_ry == 2) apply_analog_filter(cs.ry, _prev.ry);
             
             // Triggers: apply analog filter only if not in digital mode
             if (!ltDig) {
                 int mode_lt = _signal_mode[(size_t)Signal::LeftTrigger].load(std::memory_order_acquire);
-                if (mode_lt == 2) apply_analog_filter(cs.lt, _prev.lt, Signal::LeftTrigger);
+                if (mode_lt == 2) apply_analog_filter(cs.lt, _prev.lt);
             }
             if (!rtDig) {
                 int mode_rt = _signal_mode[(size_t)Signal::RightTrigger].load(std::memory_order_acquire);
-                if (mode_rt == 2) apply_analog_filter(cs.rt, _prev.rt, Signal::RightTrigger);
+                if (mode_rt == 2) apply_analog_filter(cs.rt, _prev.rt);
             }
         }
         
@@ -317,7 +317,7 @@ private:
                 _btn_prev_raw[i] = now;
             } else if (mode == 1) {
                 // Digital: gated debounce
-                apply_digital_filter(now, prev, i, sig);
+                apply_digital_filter(now, prev, i);
             }
             // Mode 2 (analog) not applicable to digital signals; ignore
         }
