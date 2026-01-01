@@ -288,8 +288,9 @@ std::vector<std::string> HotasReader::enumerate_devices() {
 }
 
 std::vector<HotasReader::SignalDescriptor> HotasReader::list_signals() const {
-    // Mirror the mapping used in the UI/main code. These are predefined for X56 stick.
+    // Combined signal set for X56 Stick and Throttle (from CSV mapping)
     return std::vector<SignalDescriptor>{
+        // Stick (VID 0x0738, PID 0x2221)
         {"joy_x","JOY_X",8,16,true},
         {"joy_y","JOY_Y",24,16,true},
         {"joy_z","JOY_Z",40,12,true},
@@ -303,7 +304,45 @@ std::vector<HotasReader::SignalDescriptor> HotasReader::list_signals() const {
         {"E","BTN_E",61,1,false},
         {"POV","POV",52,4,false},
         {"H1","H1",62,4,false},
-        {"H2","H2",66,4,false}
+        {"H2","H2",66,4,false},
+        // Throttle (VID 0x0738, PID 0xA221)
+        {"left_throttle","LEFT_THROTTLE",8,10,true},
+        {"right_throttle","RIGHT_THROTTLE",18,10,true},
+        {"F_wheel","F_WHEEL",67,8,true},
+        {"G_wheel","G_WHEEL",80,8,true},
+        {"RTY3","RTY3",104,8,true},
+        {"RTY4","RTY4",96,8,true},
+        {"thumb_joy_x","THUMB_JOY_X",72,8,true},
+        {"thumb_joy_y","THUMB_JOY_Y",88,8,true},
+        {"pinky_encoder","PINKY_ENCODER",57,2,false},
+        {"thumb_joy_press","THUMB_JOY_PRESS",59,1,false},
+        {"E_th","E",28,1,false},
+        {"F_th","F",29,1,false},
+        {"G_th","G",30,1,false},
+        {"H_th","H",32,1,false},
+        {"I_th","I",31,1,false},
+        {"K1_up","K1_UP",55,1,false},
+        {"K1_down","K1_DOWN",56,1,false},
+        {"slide","SLIDE",60,1,false},
+        {"SW1","SW1",33,1,false},
+        {"SW2","SW2",34,1,false},
+        {"SW3","SW3",35,1,false},
+        {"SW4","SW4",36,1,false},
+        {"SW5","SW5",37,1,false},
+        {"SW6","SW6",38,1,false},
+        {"TGL1_up","TGL1_UP",39,1,false},
+        {"TGL1_down","TGL1_DOWN",40,1,false},
+        {"TGL2_up","TGL2_UP",41,1,false},
+        {"TGL2_down","TGL2_DOWN",42,1,false},
+        {"TGL3_up","TGL3_UP",43,1,false},
+        {"TGL3_down","TGL3_DOWN",44,1,false},
+        {"TGL4_up","TGL4_UP",45,1,false},
+        {"TGL4_down","TGL4_DOWN",46,1,false},
+        {"M1","M1",61,1,false},
+        {"M2","M2",62,1,false},
+        {"S1","S1",63,1,false},
+        {"H3","H3",47,4,false},
+        {"H4","H4",51,4,false}
     };
 }
 
@@ -418,26 +457,17 @@ HotasSnapshot HotasReader::poll_once() {
         cs.ly = norm_u16_to_axis(joy_y_u);
         cs.rx = norm_u8_to_axis(cjoy_x_u);
         cs.ry = norm_u8_to_axis(cjoy_y_u);
-
-        // Digital trigger bit -> LT
-        uint64_t trig = extract_bits_lsb_first(stick_bytes, 56, 1);
-        cs.lt = trig ? 1.0f : 0.0f;
+        // Do not map trigger or buttons here; mapping is user-defined via HotasMapper.
+        cs.lt = 0.0f;
         cs.rt = 0.0f;
-
-        // Buttons: A/B/D/E map to XINPUT A/B/X/Y
-        WORD btns = 0;
-        if (extract_bits_lsb_first(stick_bytes, 57, 1)) btns |= XINPUT_GAMEPAD_A; // A
-        if (extract_bits_lsb_first(stick_bytes, 58, 1)) btns |= XINPUT_GAMEPAD_B; // B
-        if (extract_bits_lsb_first(stick_bytes, 60, 1)) btns |= XINPUT_GAMEPAD_X; // D
-        if (extract_bits_lsb_first(stick_bytes, 61, 1)) btns |= XINPUT_GAMEPAD_Y; // E
-        cs.buttons = btns;
+        cs.buttons = 0;
 
         any_ok = true;
     }
 
-    // Optional: map throttle sliders to triggers if available
+    // TODO: Throttle mapping implementation
     if (have_throttle) {
-        // If needed, implement throttle mapping here. For now, prefer stick trigger.
+        // Implement throttle mapping here.
     }
 
     if (any_ok) {

@@ -460,7 +460,8 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                 ImGuiID dock_main = dock_id; // middle area (remaining)
                 ImGui::DockBuilderDockWindow("Control", dock_left);
                 ImGui::DockBuilderDockWindow("Raw Signals", dock_main);
-                ImGui::DockBuilderDockWindow("HOTAS Raw", dock_main);
+                ImGui::DockBuilderDockWindow("Stick", dock_main);
+                ImGui::DockBuilderDockWindow("Throttle", dock_main);
                 ImGui::DockBuilderDockWindow("Filtered Signals", dock_right);
                 ImGui::DockBuilderDockWindow("Mappings", dock_right);
                 ImGui::DockBuilderFinish(dock_id);
@@ -901,8 +902,8 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         raw_panel.draw();
         ImGui::End();
 
-        // HOTAS Raw window: parse HID live hex and show raw integer graphs for mapped inputs
-        ImGui::Begin("HOTAS Raw", nullptr, ImGuiWindowFlags_NoBackground);
+        // Stick window: parse HID live hex and show raw integer graphs for stick inputs
+        ImGui::Begin("Stick", nullptr, ImGuiWindowFlags_NoBackground);
         // Mapping from CSV: device stick (Saitek X56)
         struct HidInputMap { const char* id; const char* name; int bit_start; int bits; bool analog; };
         static const std::vector<HidInputMap> stick_map = {
@@ -920,6 +921,45 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             {"POV",     "POV",    52,  4, false},
             {"H1",      "H1",     62,  4, false},
             {"H2",      "H2",     66,  4, false},
+        };
+        static const std::vector<HidInputMap> throttle_map = {
+            {"left_throttle",  "LEFT_THROTTLE",   8,  10, true},
+            {"right_throttle", "RIGHT_THROTTLE", 18,  10, true},
+            {"F_wheel",        "F_WHEEL",        67,   8, true},
+            {"G_wheel",        "G_WHEEL",        80,   8, true},
+            {"RTY3",           "RTY3",          104,   8, true},
+            {"RTY4",           "RTY4",           96,   8, true},
+            {"thumb_joy_x",    "THUMB_JOY_X",    72,   8, true},
+            {"thumb_joy_y",    "THUMB_JOY_Y",    88,   8, true},
+            {"pinky_encoder",  "PINKY_ENCODER",  57,   2, false},
+            {"thumb_joy_press","THUMB_JOY_PRESS",59,   1, false},
+            {"E_th",           "E",              28,   1, false},
+            {"F_th",           "F",              29,   1, false},
+            {"G_th",           "G",              30,   1, false},
+            {"H_th",           "H",              32,   1, false},
+            {"I_th",           "I",              31,   1, false},
+            {"K1_up",          "K1_UP",          55,   1, false},
+            {"K1_down",        "K1_DOWN",        56,   1, false},
+            {"slide",          "SLIDE",          60,   1, false},
+            {"SW1",            "SW1",            33,   1, false},
+            {"SW2",            "SW2",            34,   1, false},
+            {"SW3",            "SW3",            35,   1, false},
+            {"SW4",            "SW4",            36,   1, false},
+            {"SW5",            "SW5",            37,   1, false},
+            {"SW6",            "SW6",            38,   1, false},
+            {"TGL1_up",        "TGL1_UP",        39,   1, false},
+            {"TGL1_down",      "TGL1_DOWN",      40,   1, false},
+            {"TGL2_up",        "TGL2_UP",        41,   1, false},
+            {"TGL2_down",      "TGL2_DOWN",      42,   1, false},
+            {"TGL3_up",        "TGL3_UP",        43,   1, false},
+            {"TGL3_down",      "TGL3_DOWN",      44,   1, false},
+            {"TGL4_up",        "TGL4_UP",        45,   1, false},
+            {"TGL4_down",      "TGL4_DOWN",      46,   1, false},
+            {"M1",             "M1",             61,   1, false},
+            {"M2",             "M2",             62,   1, false},
+            {"S1",             "S1",             63,   1, false},
+            {"H3",             "H3",             47,   4, false},
+            {"H4",             "H4",             51,   4, false},
         };
 
         // Per-signal sample buffers
@@ -941,92 +981,88 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             }
         };
 
-        // Acquire latest HID live snapshot and pick first non-empty report
+        // Acquire latest HID live snapshot and extract stick and throttle reports separately
         auto hid_snap = hotas.get_hid_live_snapshot();
-        std::vector<uint8_t> hid_bytes;
+        std::vector<uint8_t> stick_bytes;
+        std::vector<uint8_t> throttle_bytes;
         bool have_stick_report = false;
+        bool have_throttle_report = false;
         for (auto &p : hid_snap) {
-            if (p.second.empty() || p.second == "(no data yet)") continue;
-            hex_to_bytes(p.second, hid_bytes);
-            if (!hid_bytes.empty()) { have_stick_report = true; break; }
+            const std::string &path = p.first;
+            const std::string &hex = p.second;
+            if (hex.empty() || hex == "(no data yet)") continue;
+            if (path.find("vid_0738&pid_2221") != std::string::npos && path.find("mi_00") != std::string::npos) {
+                hex_to_bytes(hex, stick_bytes);
+                have_stick_report = !stick_bytes.empty();
+            } else if (path.find("vid_0738&pid_a221") != std::string::npos && path.find("mi_00") != std::string::npos) {
+                hex_to_bytes(hex, throttle_bytes);
+                have_throttle_report = !throttle_bytes.empty();
+            }
         }
 
         double now_ts = hotas.latest_time();
-        if (!have_stick_report) {
-            ImGui::TextDisabled("No HID stick report available yet.");
+        if (!have_stick_report && !have_throttle_report) {
+            ImGui::TextDisabled("No HID stick/throttle reports available yet.");
         } else {
             double window = raw_panel.window_seconds();
             double t0 = now_ts - window;
 
             std::unordered_map<std::string,double> logical_vals;
-            for (auto &m : stick_map) {
-                uint64_t val = 0;
-                int last_bit = m.bit_start + m.bits - 1;
-                size_t needed_bytes = (last_bit / 8) + 1;
-                if (hid_bytes.size() < needed_bytes) continue;
-
-                // Extract bits LSB-first into val
-                for (int i = 0; i < m.bits; ++i) {
-                    int bit_global = m.bit_start + i;
-                    size_t byte_idx = bit_global / 8;
-                    int bit_in_byte = bit_global % 8; // LSB-first
-                    int bitv = (hid_bytes[byte_idx] >> bit_in_byte) & 1;
-                    val |= (uint64_t(bitv) << i);
-                }
-
-                double plotted = 0.0;
-                double y_min = 0.0, y_max = 1.0;
-                // By default plot raw integer ranges; for signed wide analogs treat as signed.
-                bool normalize_to_unit = false;
-                std::string mid(m.id);
-                if (m.analog && m.bits >= 12) {
-                    // Special-case: joystick axes (joy_x, joy_y, joy_z) are unsigned in your device
-                    uint64_t maxv = (1ULL << m.bits) - 1;
-                    if (mid == "joy_x" || mid == "joy_y" || mid == "joy_z") {
-                        // treat as unsigned 0..2^n-1 and normalize to -1..1
-                        plotted = (double)val;
-                        if (maxv != 0) {
-                            plotted = (plotted / (double)maxv) * 2.0 - 1.0;
-                        }
-                        y_min = -1.0; y_max = 1.0;
-                        normalize_to_unit = true;
-                    } else {
-                        // treat as signed two's complement for other wide analogs
-                        uint64_t sign_bit = (1ULL << (m.bits - 1));
-                        int64_t sval = (val & sign_bit) ? (int64_t)val - (1LL << m.bits) : (int64_t)val;
-                        // default axis range is raw signed integer
-                        y_min = -(double)(1ULL << (m.bits - 1));
-                        y_max =  (double)((1ULL << (m.bits - 1)) - 1);
-                        plotted = (double)sval;
+            auto extract_and_store = [&](const std::vector<HidInputMap>& maps, const std::vector<uint8_t>& bytes) {
+                if (bytes.empty()) return;
+                for (auto &m : maps) {
+                    uint64_t val = 0;
+                    int last_bit = m.bit_start + m.bits - 1;
+                    size_t needed_bytes = (last_bit / 8) + 1;
+                    if (bytes.size() < needed_bytes) continue;
+                    // Extract bits LSB-first into val
+                    for (int i = 0; i < m.bits; ++i) {
+                        int bit_global = m.bit_start + i;
+                        size_t byte_idx = bit_global / 8;
+                        int bit_in_byte = bit_global % 8; // LSB-first
+                        int bitv = (bytes[byte_idx] >> bit_in_byte) & 1;
+                        val |= (uint64_t(bitv) << i);
                     }
-                } else if (m.analog) {
-                    // smaller analog fields: plot unsigned 0..2^n-1
-                    double maxv = (double)((1ULL << m.bits) - 1);
-                    y_min = 0.0;
-                    y_max = maxv;
-                    plotted = (double)val;
-                    // normalize center-stick small-axis? only normalize full sticks above
-                } else {
-                    // digital / enumeration
-                    y_min = 0.0;
-                    y_max = (double)((1ULL << m.bits) - 1);
-                    plotted = (double)val;
+                    double plotted = 0.0;
+                    double y_min = 0.0, y_max = 1.0;
+                    std::string mid(m.id);
+                    // Normalize specific analogs
+                    if (mid == "joy_x" || mid == "joy_y" || mid == "joy_z") {
+                        // 12-16 bit unsig -> -1..1
+                        double maxv = (double)((1ULL << m.bits) - 1);
+                        plotted = (maxv > 0.0) ? (double)val / maxv * 2.0 - 1.0 : 0.0;
+                        y_min = -1.0; y_max = 1.0;
+                    } else if (mid == "c_joy_x" || mid == "c_joy_y" || mid == "thumb_joy_x" || mid == "thumb_joy_y") {
+                        // 8-bit joystick-like -> -1..1
+                        plotted = ((double)val / 255.0) * 2.0 - 1.0;
+                        y_min = -1.0; y_max = 1.0;
+                    } else if (mid == "left_throttle" || mid == "right_throttle") {
+                        // 10-bit throttle -> 0..1
+                        plotted = (double)val / (double)((1ULL << m.bits) - 1);
+                        y_min = 0.0; y_max = 1.0;
+                    } else if (m.analog) {
+                        // Other analogs: plot raw 0..(2^bits-1)
+                        y_min = 0.0; y_max = (double)((1ULL << m.bits) - 1);
+                        plotted = (double)val;
+                    } else {
+                        // digital/multi: raw value
+                        y_min = 0.0; y_max = (double)((1ULL << m.bits) - 1);
+                        plotted = (double)val;
+                    }
+                    Buf &b = g_hid_buffers[m.name];
+                    b.t.push_back(now_ts);
+                    b.v.push_back(plotted);
+                    logical_vals[mid] = plotted;
+                    size_t first_keep = 0;
+                    while (first_keep < b.t.size() && b.t[first_keep] < t0) ++first_keep;
+                    if (first_keep > 0) {
+                        b.t.erase(b.t.begin(), b.t.begin() + first_keep);
+                        b.v.erase(b.v.begin(), b.v.begin() + first_keep);
+                    }
                 }
-
-                // Append to buffer and trim by time window
-                Buf &b = g_hid_buffers[m.name];
-                b.t.push_back(now_ts);
-                b.v.push_back(plotted);
-                // store logical sample for constructing ControllerState
-                logical_vals[m.id] = plotted;
-                size_t first_keep = 0;
-                while (first_keep < b.t.size() && b.t[first_keep] < t0) ++first_keep;
-                if (first_keep > 0) {
-                    b.t.erase(b.t.begin(), b.t.begin() + first_keep);
-                    b.v.erase(b.v.begin(), b.v.begin() + first_keep);
-                }
-
-            }
+            };
+            if (have_stick_report) extract_and_store(stick_map, stick_bytes);
+            if (have_throttle_report) extract_and_store(throttle_map, throttle_bytes);
 
                 // Build a ControllerState from logical values (for visualization only)
                 XInputPoller::ControllerState cs{};
@@ -1084,19 +1120,73 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
                 // Joy Stick: JOY_X, JOY_Y, JOY_Z (normalized -1..1)
                 plot_group("Joy Stick", { {"JOY_X","x"}, {"JOY_Y","y"}, {"JOY_Z","z"} }, -1.0f, 1.0f);
-                // C-Joy: C_JOY_X, C_JOY_Y (0..255)
-                plot_group("C-Joy", { {"C_JOY_X","x"}, {"C_JOY_Y","y"} }, 0.0f, 255.0f);
+                // C-Joy: C_JOY_X, C_JOY_Y (normalized -1..1)
+                plot_group("C-Joy", { {"C_JOY_X","x"}, {"C_JOY_Y","y"} }, -1.0f, 1.0f);
                 // Triggers: TRIGGER, BTN_E (0..1)
                 plot_group("Triggers", { {"TRIGGER","Trigger"}, {"BTN_E","pinky trigger"} }, 0.0f, 1.0f);
                 // Buttons: BTN_A, BTN_B, C, BTN_D (0..1)
                 plot_group("Buttons", { {"BTN_A","A"}, {"BTN_B","B"}, {"C","C"}, {"BTN_D","D"} }, 0.0f, 1.0f);
-                // POV: 0..15
+                // POV/Hats on stick: 0..15
                 plot_group("POV", { {"POV","POV"} }, 0.0f, 15.0f);
-                // H1: 0..15
                 plot_group("H1", { {"H1","H1"} }, 0.0f, 15.0f);
-                // H2: 0..15
                 plot_group("H2", { {"H2","H2"} }, 0.0f, 15.0f);
             }
+        ImGui::End();
+
+        // Throttle window: visualize throttle inputs using previously extracted buffers
+        ImGui::Begin("Throttle", nullptr, ImGuiWindowFlags_NoBackground);
+        {
+            auto plot_group = [&](const char* title, const std::vector<std::pair<const char*, const char*>>& series, float y_min, float y_max) {
+                double window = raw_panel.window_seconds();
+                double latest = hotas.latest_time();
+                double t0 = latest - window;
+                struct S { std::vector<double> x; std::vector<double> y; const char* name; };
+                std::vector<S> all;
+                for (auto &p : series) {
+                    auto it = g_hid_buffers.find(p.first);
+                    if (it == g_hid_buffers.end()) continue;
+                    const Buf &buf = it->second;
+                    S s; s.name = p.second;
+                    s.x.reserve(buf.t.size());
+                    s.y.reserve(buf.v.size());
+                    for (size_t i = 0; i < buf.t.size(); ++i) {
+                        double rel = buf.t[i] - t0;
+                        if (rel < 0) continue;
+                        s.x.push_back(rel);
+                        s.y.push_back(buf.v[i]);
+                    }
+                    if (!s.x.empty()) all.push_back(std::move(s));
+                }
+                if (all.empty()) return;
+                if (ImPlot::BeginPlot(title, ImVec2(-1, 130), ImPlotFlags_NoTitle)) {
+                    ImPlot::SetupAxes("Time (s)", "Value", ImPlotAxisFlags_NoTickLabels, ImPlotAxisFlags_AutoFit);
+                    ImPlot::SetupAxisLimits(ImAxis_X1, 0, window, ImGuiCond_Always);
+                    ImPlot::SetupAxisLimits(ImAxis_Y1, y_min, y_max, ImGuiCond_Always);
+                    for (auto &s : all) {
+                        ImPlot::PlotLine(s.name, s.x.data(), s.y.data(), (int)s.x.size());
+                    }
+                    ImPlot::EndPlot();
+                }
+            };
+
+            // Throttle Quadrant: LEFT/RIGHT_THROTTLE (0..1)
+            plot_group("Throttle", { {"LEFT_THROTTLE","Left"}, {"RIGHT_THROTTLE","Right"} }, 0.0f, 1.0f);
+            // Throttle Thumb Joystick: THUMB_JOY_X/Y (-1..1)
+            plot_group("Thumb Joystick", { {"THUMB_JOY_X","x"}, {"THUMB_JOY_Y","y"} }, -1.0f, 1.0f);
+            // Throttle Wheels/RTY (0..255)
+            plot_group("Wheels", { {"F_WHEEL","F"}, {"G_WHEEL","G"} }, 0.0f, 255.0f);
+            plot_group("Rotaries", { {"RTY3","RTY3"}, {"RTY4","RTY4"} }, 0.0f, 255.0f);
+            // Throttle Buttons (0..1)
+            plot_group("Throttle Buttons", {
+                {"THUMB_JOY_PRESS","Thumb Press"}, {"E","E"}, {"F","F"}, {"G","G"}, {"H","H"}, {"I","I"},
+                {"K1_UP","K1 Up"}, {"K1_DOWN","K1 Down"}, {"SLIDE","Slide"}, {"SW1","SW1"}, {"SW2","SW2"}, {"SW3","SW3"},
+                {"SW4","SW4"}, {"SW5","SW5"}, {"SW6","SW6"}, {"TGL1_UP","TGL1 Up"}, {"TGL1_DOWN","TGL1 Down"},
+                {"TGL2_UP","TGL2 Up"}, {"TGL2_DOWN","TGL2 Down"}, {"TGL3_UP","TGL3 Up"}, {"TGL3_DOWN","TGL3 Down"},
+                {"TGL4_UP","TGL4 Up"}, {"TGL4_DOWN","TGL4 Down"}, {"M1","M1"}, {"M2","M2"}, {"S1","S1"}
+            }, 0.0f, 1.0f);
+            // Throttle Hats H3/H4 (0..15)
+            plot_group("H3/H4", { {"H3","H3"}, {"H4","H4"} }, 0.0f, 15.0f);
+        }
         ImGui::End();
 
         // HID Live monitor (temporary) - only visible in Developer View
