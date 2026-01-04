@@ -515,11 +515,38 @@ HotasSnapshot HotasReader::poll_once() {
     return snap;
 }
 
-bool HotasReader::has_stick() const { 
-    return internal_state && internal_state->stick_handle != INVALID_HANDLE_VALUE; 
+bool HotasReader::has_stick() const {
+    if (!internal_state) return false;
+    const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    const double fresh_thresh = 0.5; // seconds; consider connected only with recent HID activity
+    std::lock_guard<std::mutex> g(internal_state->live_mutex);
+    for (const auto& kv : internal_state->live_last) {
+        const std::string& path = kv.first;
+        const auto& entry = kv.second;
+        if (path.find("vid_0738&pid_2221") != std::string::npos && path.find("mi_00") != std::string::npos) {
+            if (!entry.hex.empty() && entry.hex != "(no data yet)" && entry.ts > 0.0 && (now - entry.ts) <= fresh_thresh) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
-bool HotasReader::has_throttle() const { 
-    return internal_state && internal_state->throttle_handle != INVALID_HANDLE_VALUE; 
+
+bool HotasReader::has_throttle() const {
+    if (!internal_state) return false;
+    const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    const double fresh_thresh = 0.5; // seconds; consider connected only with recent HID activity
+    std::lock_guard<std::mutex> g(internal_state->live_mutex);
+    for (const auto& kv : internal_state->live_last) {
+        const std::string& path = kv.first;
+        const auto& entry = kv.second;
+        if (path.find("vid_0738&pid_a221") != std::string::npos && path.find("mi_00") != std::string::npos) {
+            if (!entry.hex.empty() && entry.hex != "(no data yet)" && entry.ts > 0.0 && (now - entry.ts) <= fresh_thresh) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 double HotasReader::latest_time() const { return internal_state ? internal_state->latest.load(std::memory_order_acquire) : 0.0; }

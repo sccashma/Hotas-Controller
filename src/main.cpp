@@ -33,6 +33,8 @@
 #include "xinput/filtered_forwarder.hpp"
 #include "xinput/hotas_reader.hpp"
 #include "xinput/hotas_mapper.hpp"
+// Plots for XInput signals (sticks, triggers, buttons)
+#include "ui/plots_panel.hpp"
 
 // Shared HID buffers for raw Stick/Throttle plotting
 struct HidBuf { std::vector<double> t; std::vector<double> v; };
@@ -111,6 +113,14 @@ struct FilterSettings {
 // Global runtime parameters (window_seconds persisted; target_hz fixed at 1 kHz)
 static double g_window_seconds = 30.0;   // plot window length (persisted)
 static bool g_virtual_output_enabled = false; // persisted flag
+
+// Virtual Output monitor globals
+static bool g_show_virtual_output_window = false;
+static XInputPoller g_output_poller; // polls XInput state of the (virtual) controller
+static PlotConfig g_output_plot_cfg{}; // default config; window_seconds set at runtime
+static PlotsPanel g_output_plots(g_output_poller, g_output_plot_cfg);
+static bool g_output_started = false;
+static int g_output_controller_idx = 0; // index to poll (choose the ViGEm virtual pad)
 
 static bool LoadFilterSettings(const char* path, FilterSettings& fs) {
     std::ifstream in(path, std::ios::in); if (!in) return false;
@@ -506,6 +516,39 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     }
     // Load persisted HOTAS mappings at startup
     hotas_mapper.load_profile("config/mappings.json");
+    // Migrate legacy mappings (no device prefix) to device-prefixed IDs
+    {
+        auto entries = hotas_mapper.list_mapping_entries();
+        if (!entries.empty()) {
+            // Build id -> device map; mark ambiguous ids
+            struct DevInfo { bool seen = false; HotasReader::SignalDescriptor::DeviceKind dk{}; bool ambiguous = false; };
+            std::unordered_map<std::string, DevInfo> id_map;
+            for (const auto &sd : hotas.list_signals()) {
+                auto &di = id_map[sd.id];
+                if (!di.seen) { di.seen = true; di.dk = sd.device; }
+                else { di.ambiguous = true; }
+            }
+            bool changed = false;
+            for (const auto &me : entries) {
+                if (me.signal_id.find(':') == std::string::npos) {
+                    auto it = id_map.find(me.signal_id);
+                    if (it != id_map.end() && it->second.seen && !it->second.ambiguous) {
+                        const char* devp = (it->second.dk == HotasReader::SignalDescriptor::DeviceKind::Stick) ? "stick" : "throttle";
+                        std::string new_sig = std::string(devp) + ":" + me.signal_id;
+                        // Replace mapping entry with updated signal_id
+                        hotas_mapper.remove_mapping(me.id);
+                        MappingEntry updated = me; updated.signal_id = new_sig;
+                        hotas_mapper.add_mapping(updated);
+                        changed = true;
+                    }
+                }
+            }
+            if (changed) {
+                // Persist normalized mappings
+                hotas_mapper.save_profile("config/mappings.json");
+            }
+        }
+    }
     // Inject mapped controller states back into the poller for plotting/filtering
     hotas_mapper.set_inject_callback([&](double t, const XInputPoller::ControllerState& cs){
         poller.inject_state(t, cs);
@@ -546,7 +589,11 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         auto next_refresh_tp = clock::now();
         // Per-signal filter state (id -> prev/current)
         std::unordered_map<std::string,double> prev_vals;
+        // Track previous RAW values separately for digital gating state machine
+        std::unordered_map<std::string,double> prev_raw_vals;
         std::unordered_map<std::string,double> rise_times;
+        // For multi-bit digital signals (e.g., hats), track pending target value
+        std::unordered_map<std::string,double> pending_vals;
         std::unordered_map<std::string,bool> active_flags;
         while (hotas_bg_thread_running.load()) {
             // HOTAS input always enabled
@@ -643,27 +690,52 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                             double dv = fabs(out_v - prev);
                             if (dv >= working.analog_delta) out_v = prev;
                         } else if (mode == 1) {
-                            // Digital debounce/gating: interpret non-analog values >0 as active
-                            bool now_hi = sd.analog ? (out_v >= 0.5) : (out_v > 0.0);
-                            bool prev_hi = active_flags.count(map_key) ? active_flags[map_key] : false;
+                            // Digital debounce/gating
                             double &rise = rise_times[map_key];
-                            if (!prev_vals.count(map_key)) rise = -1.0;
-                            if (now_hi && !prev_hi) {
-                                rise = now;
-                                active_flags[map_key] = false;
-                            } else if (now_hi && prev_hi) {
-                                if (!active_flags[map_key] && rise >= 0.0) {
-                                    double dur = now - rise;
-                                    if (dur >= (working.digital_max_ms/1000.0)) active_flags[map_key] = true;
+                            if (!sd.analog && sd.bits > 1) {
+                                // Multi-bit digital (e.g., hats): gate discrete value changes
+                                double prev_filtered = prev_vals.count(map_key) ? prev_vals[map_key] : v;
+                                double prev_raw = prev_raw_vals.count(map_key) ? prev_raw_vals[map_key] : v;
+                                double &pend = pending_vals[map_key];
+                                if (!prev_raw_vals.count(map_key)) {
+                                    rise = -1.0; pend = v; out_v = v;
+                                } else {
+                                    if (v != prev_raw) {
+                                        // Value changed; start/refresh hold timer and keep previous filtered value
+                                        rise = now; pend = v; out_v = prev_filtered;
+                                    } else {
+                                        // Stable; promote after threshold when pending matches and differs from filtered
+                                        if (rise >= 0.0 && (now - rise) >= (working.digital_max_ms/1000.0) && pend == v && v != prev_filtered) {
+                                            out_v = v; rise = -1.0;
+                                        } else {
+                                            out_v = prev_filtered;
+                                        }
+                                    }
                                 }
-                            } else if (!now_hi && prev_hi) {
-                                active_flags[map_key] = false; rise = -1.0;
                             } else {
-                                rise = -1.0; active_flags[map_key] = false;
+                                // Binary digital: interpret non-analog values >0 as active
+                                bool now_hi = sd.analog ? (v >= 0.5) : (v > 0.0);
+                                double prev_raw = prev_raw_vals.count(map_key) ? prev_raw_vals[map_key] : v;
+                                bool prev_hi = sd.analog ? (prev_raw >= 0.5) : (prev_raw > 0.0);
+                                if (!prev_raw_vals.count(map_key)) rise = -1.0;
+                                if (now_hi && !prev_hi) {
+                                    rise = now; active_flags[map_key] = false;
+                                } else if (now_hi && prev_hi) {
+                                    if (!active_flags[map_key] && rise >= 0.0) {
+                                        double dur = now - rise;
+                                        if (dur >= (working.digital_max_ms/1000.0)) active_flags[map_key] = true;
+                                    }
+                                } else if (!now_hi && prev_hi) {
+                                    active_flags[map_key] = false; rise = -1.0;
+                                } else {
+                                    rise = -1.0; active_flags[map_key] = false;
+                                }
+                                out_v = active_flags[map_key] ? 1.0 : 0.0;
                             }
-                            out_v = active_flags[map_key] ? 1.0 : 0.0;
                         }
+                        // Store previous values: filtered for analog spikes, RAW for digital gating
                         prev_vals[map_key] = out_v;
+                        prev_raw_vals[map_key] = v;
                         hotas_mapper.accept_sample(map_key, out_v, now);
                         // Store filtered value for UI plots
                         HidBuf &fb = g_hid_filtered_buffers[std::string(device_prefix(sd.device)) + ":" + sd.name];
@@ -778,6 +850,19 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                             }
                             show_hotas_detect_window = true;
                         }
+                        // Toggle: Virtual Output Monitor (X360)
+                        bool open_vom = g_show_virtual_output_window;
+                        if (ImGui::MenuItem("Virtual Output Monitor", nullptr, open_vom)) {
+                            g_show_virtual_output_window = !g_show_virtual_output_window;
+                            if (g_show_virtual_output_window && !g_output_started) {
+                                // Start dedicated XInput poller at fixed 1 kHz
+                                g_output_poller.start(g_output_controller_idx, 1000.0, g_window_seconds);
+                                g_output_started = true;
+                            } else if (!g_show_virtual_output_window && g_output_started) {
+                                g_output_poller.stop();
+                                g_output_started = false;
+                            }
+                        }
                         static bool show_developer_view_menu = false;
                         if (ImGui::MenuItem("Developer View", nullptr, &show_developer_view_menu)) {
                             // toggle developer view; actual docking handled after layout build
@@ -803,6 +888,8 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                 ImGui::DockBuilderDockWindow("Throttle", dock_main);
                 ImGui::DockBuilderDockWindow("Filtered Signals", dock_right);
                 ImGui::DockBuilderDockWindow("Mappings", dock_right);
+                // Dock Virtual Output monitor into right column
+                ImGui::DockBuilderDockWindow("Virtual Output (X360)", dock_right);
                 ImGui::DockBuilderFinish(dock_id);
             }
             // Developer view docking: create bottom dock for HID Live when requested
@@ -875,6 +962,9 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             poller.set_window_seconds(win);
             forwarder.set_window_seconds(win);
             g_window_seconds = win;
+            // Keep Virtual Output monitor in sync
+            g_output_poller.set_window_seconds(win);
+            g_output_plots.set_window_seconds(win);
         }
         ImGui::SetNextItemWidth(100);
         if (ImGui::InputDouble("Window Exact", &win, 0.1, 1.0, "%.1f")) {
@@ -882,6 +972,8 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             poller.set_window_seconds(win);
             forwarder.set_window_seconds(win);
             g_window_seconds = win;
+            g_output_poller.set_window_seconds(win);
+            g_output_plots.set_window_seconds(win);
         }
         if (ImGui::Button("Clear Plots")) { poller.clear(); forwarder.clear_filtered(); }
         // Filter / Anomaly detection controls
@@ -995,6 +1087,38 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         }
         ImGui::End();
 
+        // Virtual Output monitor pane
+        if (g_show_virtual_output_window) {
+            ImGui::Begin("Virtual Output (X360)", nullptr, ImGuiWindowFlags_NoBackground);
+            {
+                // Controller selection for the emulated device (index 0-3)
+                g_output_controller_idx = g_output_poller.controller_index();
+                ImGui::SetNextItemWidth(120);
+                if (ImGui::SliderInt("Controller Index (Output)", &g_output_controller_idx, 0, 3)) {
+                    g_output_poller.set_controller_index(g_output_controller_idx);
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Auto Detect")) {
+                    int found = -1;
+                    for (int i = 0; i < 4; ++i) {
+                        XINPUT_STATE st{}; if (XInputGetState(i, &st) == ERROR_SUCCESS) { found = i; break; }
+                    }
+                    if (found >= 0) { g_output_poller.set_controller_index(found); }
+                }
+                // Stats display (effective Hz, avg loop time)
+                auto out_stats = g_output_poller.stats();
+                ImGui::Text("Effective Hz: %.1f", out_stats.effective_hz);
+                if (out_stats.avg_loop_us > 0.0) ImGui::Text("Avg loop: %.2f us", out_stats.avg_loop_us);
+                ImGui::Text("XInput Connected: %s", g_output_poller.connected() ? "Yes" : "No");
+
+                // Configure plots: fixed window, anomaly highlighting off for output
+                g_output_plots.set_window_seconds(g_window_seconds);
+                g_output_plots.set_filter_mode(false);
+                g_output_plots.draw();
+            }
+            ImGui::End();
+        }
+
         // HOTAS detection window (Help -> Detect Inputs...)
         if (show_hotas_detect_window) {
             ImGui::Begin("Detect HOTAS Devices", &show_hotas_detect_window, ImGuiWindowFlags_NoBackground);
@@ -1061,7 +1185,9 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                                (device_sel == 1 && sd.device == HotasReader::SignalDescriptor::DeviceKind::Stick) ||
                                (device_sel == 2 && sd.device == HotasReader::SignalDescriptor::DeviceKind::Throttle);
                 if (!include) continue;
-                SigChoice ch; ch.id = sd.id; ch.display = sd.name + std::string(" (") + sd.id + ")";
+                SigChoice ch;
+                ch.id = std::string(device_prefix(sd.device)) + ":" + sd.id; // always device-prefixed for unambiguous mapping
+                ch.display = sd.name + std::string(" (") + sd.id + ")";
                 sig_choices.push_back(std::move(ch));
             }
             if (sig_choices.empty()) {
