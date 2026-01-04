@@ -126,9 +126,28 @@ static UINT parse_vk(const std::string& name) {
     return 0; // unknown
 }
 
+static bool is_extended_vk(UINT vk) {
+    switch (vk) {
+        case VK_RMENU: case VK_RCONTROL:
+        case VK_INSERT: case VK_DELETE:
+        case VK_HOME: case VK_END:
+        case VK_PRIOR: case VK_NEXT: // PageUp/PageDown
+        case VK_LEFT: case VK_RIGHT: case VK_UP: case VK_DOWN:
+        case VK_DIVIDE: case VK_NUMLOCK:
+            return true;
+        default: return false;
+    }
+}
+
 static void send_key(UINT vk, bool down) {
     if (vk == 0) return;
-    INPUT in{}; in.type = INPUT_KEYBOARD; in.ki.wVk = (WORD)vk; in.ki.dwFlags = down ? 0 : KEYEVENTF_KEYUP;
+    HKL layout = GetKeyboardLayout(0);
+    UINT sc = MapVirtualKeyEx(vk, MAPVK_VK_TO_VSC, layout);
+    INPUT in{}; in.type = INPUT_KEYBOARD;
+    in.ki.wVk = 0; // use scan code to ensure proper 'code' and game handling
+    in.ki.wScan = (WORD)sc;
+    in.ki.dwFlags = KEYEVENTF_SCANCODE | (down ? 0 : KEYEVENTF_KEYUP);
+    if (is_extended_vk(vk)) in.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
     SendInput(1, &in, sizeof(INPUT));
 }
 

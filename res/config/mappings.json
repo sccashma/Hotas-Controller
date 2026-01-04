@@ -99,18 +99,32 @@
       "signal_id": "stick:POV_DOWN"
     },
     {
-      "action": "x360:right_trigger",
-      "deadband": 0.05,
-      "id": "fire",
-      "priority": 0,
-      "signal_id": "stick:trigger"
-    },
-    {
       "action": "x360:button_y",
       "deadband": 0.05,
       "id": "ping",
       "priority": 0,
       "signal_id": "throttle:H"
+    },
+    {
+      "action": "x360:dpad_up",
+      "deadband": 0.05,
+      "id": "d-up",
+      "priority": 0,
+      "signal_id": "stick:H2_UP"
+    },
+    {
+      "action": "x360:dpad_down",
+      "deadband": 0.05,
+      "id": "d-down",
+      "priority": 0,
+      "signal_id": "stick:H2_DOWN"
+    },
+    {
+      "action": "x360:right_trigger",
+      "deadband": 0.05,
+      "id": "trigger",
+      "priority": 0,
+      "signal_id": "stick:trigger"
     }
   ]
 }
