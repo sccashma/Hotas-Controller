@@ -100,7 +100,7 @@ static void PlotHidGroup(const char* title,
 
 struct FilterSettings {
     bool enabled = false;
-    float analog_delta = 0.05f;
+    float analog_delta = 5.0f; // percent of full range per sample (0-100)
     double digital_max_ms = 5.0; // stored in milliseconds for UI
     bool left_trigger_digital = false; // treat LT as digital for filtering
     bool right_trigger_digital = false; // treat RT as digital for filtering
@@ -151,7 +151,13 @@ static bool LoadFilterSettings(const char* path, FilterSettings& fs) {
     };
     
     fs.enabled = getb("enabled", fs.enabled);
-    fs.analog_delta = getf("analog_delta", fs.analog_delta);
+    {
+        float raw = getf("analog_delta", fs.analog_delta);
+        // Backward compatibility: if stored as fraction 0..1, convert to percent
+        fs.analog_delta = (raw <= 1.0f) ? (raw * 100.0f) : raw;
+        if (fs.analog_delta < 0.0f) fs.analog_delta = 0.0f;
+        if (fs.analog_delta > 100.0f) fs.analog_delta = 100.0f;
+    }
     fs.digital_max_ms = getd("digital_max_ms", fs.digital_max_ms);
     g_window_seconds = getd("window_seconds", g_window_seconds);
     g_virtual_output_enabled = getb("virtual_output", g_virtual_output_enabled);
@@ -684,10 +690,17 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                         if (fm_it != hotas_filter_modes.end()) mode = fm_it->second;
                         double out_v = v;
                         if (mode == 2) {
-                            // Analog rate limiter: cap per-sample change to analog_delta
+                            // Analog rate limiter: cap per-sample change to percent of full range
                             double prev_filtered = prev_vals.count(map_key) ? prev_vals[map_key] : v;
                             double dv = v - prev_filtered;
-                            double max_step = working.analog_delta;
+                            // Determine full range for this signal based on normalization
+                            double full_range = 1.0;
+                            if (sd.id == "JOY_X" || sd.id == "JOY_Y" || sd.id == "JOY_Z" || sd.id == "left_throttle" || sd.id == "right_throttle") {
+                                full_range = 2.0; // normalized to -1..1
+                            } else if (sd.analog && sd.bits > 0) {
+                                full_range = (double)((1ULL << sd.bits) - 1ULL); // raw integer range
+                            }
+                            double max_step = (working.analog_delta / 100.0) * full_range;
                             if (dv > max_step) out_v = prev_filtered + max_step;
                             else if (dv < -max_step) out_v = prev_filtered - max_step;
                             else out_v = v;
@@ -839,14 +852,27 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
-        // Draw background image to viewport
+        // Draw background image to viewport with uniform scaling (cover)
         {
             const ImGuiViewport* vp = ImGui::GetMainViewport();
-            if (g_backgroundSRV && vp) {
+            if (g_backgroundSRV && vp && g_bg_width > 0 && g_bg_height > 0) {
                 ImDrawList* dl = ImGui::GetBackgroundDrawList();
-                ImVec2 pos = vp->Pos;
-                ImVec2 size = vp->Size;
-                dl->AddImage((void*)g_backgroundSRV, pos, ImVec2(pos.x + size.x, pos.y + size.y));
+                ImVec2 vp_pos = vp->Pos;
+                ImVec2 vp_size = vp->Size;
+                float vp_w = vp_size.x;
+                float vp_h = vp_size.y;
+                float img_w = (float)g_bg_width;
+                float img_h = (float)g_bg_height;
+                // Compute scale to cover viewport while preserving aspect ratio
+                float scale = std::max(vp_w / img_w, vp_h / img_h);
+                float draw_w = img_w * scale;
+                float draw_h = img_h * scale;
+                // Center the image in the viewport
+                float x0 = vp_pos.x + (vp_w - draw_w) * 0.5f;
+                float y0 = vp_pos.y + (vp_h - draw_h) * 0.5f;
+                ImVec2 p_min(x0, y0);
+                ImVec2 p_max(x0 + draw_w, y0 + draw_h);
+                dl->AddImage((void*)g_backgroundSRV, p_min, p_max);
             }
         }
 
@@ -922,8 +948,9 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                 ImGui::DockBuilderAddNode(dock_id, ImGuiDockNodeFlags_DockSpace);
                 ImGui::DockBuilderSetNodeSize(dock_id, viewport->Size);
                 // Create a three-column layout: left (Control), middle (Stick/Throttle), right (Filtered Signals)
+                // Ensure middle and right are equal widths by splitting the remaining space 50/50.
                 ImGuiID dock_left = ImGui::DockBuilderSplitNode(dock_id, ImGuiDir_Left, 0.22f, nullptr, &dock_id); // 22% left panel
-                ImGuiID dock_right = ImGui::DockBuilderSplitNode(dock_id, ImGuiDir_Right, 0.33f, nullptr, &dock_id); // 33% right panel
+                ImGuiID dock_right = ImGui::DockBuilderSplitNode(dock_id, ImGuiDir_Right, 0.50f, nullptr, &dock_id); // split remaining equally for right vs middle
                 ImGuiID dock_main = dock_id; // middle area (remaining)
                 ImGui::DockBuilderDockWindow("Control", dock_left);
                 ImGui::DockBuilderDockWindow("Stick", dock_main);
@@ -968,12 +995,7 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         ImGui::SameLine(); ImGui::TextDisabled("Mapper");
         ImGui::Text("Backend: %s | Output: %s", "ViGEm (HotasMapper)", virtual_enabled ? "On" : "Off");
         // Controller selection (0-3)
-        static int controller_idx = 0;
-        controller_idx = poller.controller_index();
-        ImGui::SetNextItemWidth(80);
-        if (ImGui::SliderInt("Controller Index", &controller_idx, 0, 3)) {
-            poller.set_controller_index(controller_idx);
-        }
+        // Controller Index slider removed: input is sourced from HOTAS only.
         ImGui::SameLine();
         if (ImGui::SmallButton("Auto Detect")) {
             // Probe all 4 once and pick the first reporting connected
@@ -1031,7 +1053,7 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             }
             if (filter_mode) {
                 bool updated = false;
-                updated |= ImGui::SliderFloat("Analog Rate Limit (per sample)", &analog_delta, 0.05f, 1.0f, "%.2f");
+                updated |= ImGui::SliderFloat("Analog Rate Limit (% full range per sample)", &analog_delta, 0.0f, 100.0f, "%.0f%%");
                 double dp_min = 0.1; double dp_max = 500.0; // 0.1ms .. 500ms
                 updated |= ImGui::SliderScalar("Digital Pulse Max (ms)", ImGuiDataType_Double, &digital_max, &dp_min, &dp_max, "%.2f");
                 bool lt_dig = working.left_trigger_digital;

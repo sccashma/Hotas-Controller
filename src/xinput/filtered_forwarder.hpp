@@ -48,9 +48,9 @@ public:
         }
         if (_client) vigem_free(_client);
     }
-    void set_params(float analog_delta, double digital_max_sec) {
+    void set_params(float analog_delta_pct, double digital_max_sec) {
         std::lock_guard<std::mutex> lk(_mtx);
-        _analog_delta = analog_delta;
+        _analog_rate_pct = analog_delta_pct;
         _digital_max = digital_max_sec;
     }
     // Set per-signal filter modes: 0=none, 1=digital, 2=analog
@@ -229,10 +229,11 @@ private:
         }
         
         // Apply per-signal analog or digital filtering based on mode
-        // Analog: rate limiter — cap per-sample change to _analog_delta
+        // Analog: rate limiter — cap per-sample change to percent of full range
         auto apply_analog_filter = [&](float &cur, float prev) {
             float dv = cur - prev;
-            float max_step = _analog_delta;
+            float range = ((prev >= 0.0f && prev <= 1.0f) && (cur >= 0.0f && cur <= 1.0f)) ? 1.0f : 2.0f;
+            float max_step = (_analog_rate_pct / 100.0f) * range;
             if (dv > max_step) cur = prev + max_step;
             else if (dv < -max_step) cur = prev - max_step;
         };
@@ -333,7 +334,7 @@ private:
     std::string _last_update_status; // empty if OK
     PVIGEM_CLIENT _client = nullptr;
     PVIGEM_TARGET _target = nullptr;
-    float _analog_delta = 0.05f;
+    float _analog_rate_pct = 5.0f;
     double _digital_max = 0.005;
     XInputPoller::ControllerState _prev{}; bool _have_prev=false;
     double _rise_time[16] = { -1.0 }; // per-button pending rise time (buttons + digital triggers)
