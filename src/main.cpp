@@ -416,6 +416,20 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     // Increase timer resolution for better sub-millisecond sleep precision
     timeBeginPeriod(1);
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    // Ensure all relative resource paths resolve next to the executable
+    // When launched from arbitrary locations (e.g., copied folder), set CWD to exe directory
+    {
+        wchar_t exe_path[MAX_PATH];
+        DWORD n = GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
+        if (n > 0 && n < MAX_PATH) {
+            // Trim to directory component
+            wchar_t *last_bs = wcsrchr(exe_path, L'\\');
+            if (last_bs) {
+                *last_bs = L'\0';
+                SetCurrentDirectoryW(exe_path);
+            }
+        }
+    }
     // Register class
     WNDCLASSEX wc{ sizeof(WNDCLASSEX), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, _T("XInputPlotter"), nullptr };
     RegisterClassEx(&wc);
@@ -451,24 +465,17 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
 
-    // Load background image (try common relative paths)
+    // Load background image from portable graphics folder next to the exe
     const wchar_t* candidates[] = {
-        L"res\\graphics\\HOTAS_Controller.png",
-        L"..\\res\\graphics\\HOTAS_Controller.png",
-        L"..\\..\\res\\graphics\\HOTAS_Controller.png"
+        L"graphics\\HOTAS_Controller.png"
     };
     for (auto* path : candidates) {
         if (LoadTextureWIC(path, g_pd3dDevice, g_pd3dDeviceContext, &g_backgroundSRV, &g_bg_width, &g_bg_height)) break;
     }
 
-    // Load keyboard icon strictly from SVG (no PNG/text fallbacks)
+    // Load keyboard icon strictly from SVG in the portable graphics folder
     const wchar_t* kb_svg_candidates[] = {
-        L"graphics\\keyboard.svg",
-        L"..\\graphics\\keyboard.svg",
-        L"..\\..\\graphics\\keyboard.svg",
-        L"res\\graphics\\keyboard.svg",
-        L"..\\res\\graphics\\keyboard.svg",
-        L"..\\..\\res\\graphics\\keyboard.svg"
+        L"graphics\\keyboard.svg"
     };
     for (auto* path : kb_svg_candidates) {
         // Render SVG at fixed 64x36 pixels for crisp display

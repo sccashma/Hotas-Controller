@@ -75,6 +75,7 @@ HotasReader::HotasReader() {
 
     GUID hidGuid;
     HidD_GetHidGuid(&hidGuid);
+    
 
     HDEVINFO devInfo = SetupDiGetClassDevsW(&hidGuid, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
     if (devInfo == INVALID_HANDLE_VALUE) {
@@ -109,14 +110,14 @@ HotasReader::HotasReader() {
         }
         // Only open handles for the specific device paths requested (connection-only)
         std::string p = wcs_to_utf8(devicePath);
-        if (p.find("vid_0738&pid_2221") != std::string::npos && p.find("mi_00") != std::string::npos) {
+        if (p.find("vid_0738&pid_2221") != std::string::npos && (p.find("mi_00") != std::string::npos || p.find("mi_02") != std::string::npos)) {
             if (internal_state->stick_handle == INVALID_HANDLE_VALUE) {
                 internal_state->stick_handle = h;
                 s_debug_lines.push_back(std::string("Opened stick HID handle: ") + p);
                 continue; // keep handle
             }
         }
-        if (p.find("vid_0738&pid_a221") != std::string::npos && p.find("mi_00") != std::string::npos) {
+        if (p.find("vid_0738&pid_a221") != std::string::npos && (p.find("mi_00") != std::string::npos || p.find("mi_02") != std::string::npos)) {
             if (internal_state->throttle_handle == INVALID_HANDLE_VALUE) {
                 internal_state->throttle_handle = h;
                 s_debug_lines.push_back(std::string("Opened throttle HID handle: ") + p);
@@ -192,12 +193,9 @@ HotasReader::HotasReader() {
         internal_state->signals = std::move(sigs);
         return !internal_state->signals.empty();
     };
-    // Try common relative locations from build directory
-    if (!load_csv_signals(L"config\\X56_Hotas_hid_bit_map.csv")) {
-        if (!load_csv_signals(L"..\\X56_Hotas_hid_bit_map.csv")) {
-            load_csv_signals(L"..\\..\\X56_Hotas_hid_bit_map.csv");
-        }
-    }
+    // Load signal descriptors strictly from the portable config folder next to the exe
+    
+    load_csv_signals(L"config\\X56_Hotas_hid_bit_map.csv");
     // Fallback to built-in minimal set if CSV missing
     if (internal_state->signals.empty()) {
         internal_state->signals = std::vector<SignalDescriptor>{
@@ -268,6 +266,7 @@ static std::string to_hex(const uint8_t* d, size_t n) {
 void HotasReader::start_hid_live() {
     if (!internal_state) return;
     if (internal_state->live_running.exchange(true)) return; // already running
+    
     // enumerate device interfaces and collect matching device paths first
     GUID hidGuid; HidD_GetHidGuid(&hidGuid);
     HDEVINFO devInfo = SetupDiGetClassDevsW(&hidGuid, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
@@ -281,25 +280,34 @@ void HotasReader::start_hid_live() {
         PSP_DEVICE_INTERFACE_DETAIL_DATA_W detail = reinterpret_cast<PSP_DEVICE_INTERFACE_DETAIL_DATA_W>(buf.data());
         detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
         SP_DEVINFO_DATA devInfoData; devInfoData.cbSize = sizeof(SP_DEVINFO_DATA);
-        if (!SetupDiGetDeviceInterfaceDetailW(devInfo, &ifData, detail, required, NULL, &devInfoData)) continue;
+        if (!SetupDiGetDeviceInterfaceDetailW(devInfo, &ifData, detail, required, NULL, &devInfoData)) {
+            continue;
+        }
         std::wstring wp(detail->DevicePath);
         std::string path = wcs_to_utf8(wp.c_str());
         // Only register paths matching the exact stick/throttle identifiers requested by user
-        if ((path.find("vid_0738&pid_2221") != std::string::npos && path.find("mi_00") != std::string::npos) ||
-            (path.find("vid_0738&pid_a221") != std::string::npos && path.find("mi_00") != std::string::npos)) {
+        if ((path.find("vid_0738&pid_2221") != std::string::npos && (path.find("mi_00") != std::string::npos || path.find("mi_02") != std::string::npos)) ||
+            (path.find("vid_0738&pid_a221") != std::string::npos && (path.find("mi_00") != std::string::npos || path.find("mi_02") != std::string::npos))) {
             paths.push_back(wp);
+            
             std::lock_guard<std::mutex> g(internal_state->live_mutex);
             internal_state->live_last[path] = HotasReader::HotasReaderInternalState::LiveEntry{ std::string("(no data yet)"), 0.0 };
         }
     }
     SetupDiDestroyDeviceInfoList(devInfo);
+    
 
     // For each matching path open handle and spawn a thread to read it
     for (auto &wp : paths) {
         HANDLE h = CreateFileW(wp.c_str(), GENERIC_READ | GENERIC_WRITE,
             FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
-        if (h == INVALID_HANDLE_VALUE) continue;
+        if (h == INVALID_HANDLE_VALUE) {
+            DWORD err = GetLastError();
+            (void)err;
+            continue;
+        }
         std::string path = wcs_to_utf8(wp.c_str());
+        
         {
             std::lock_guard<std::mutex> g(internal_state->live_mutex);
             internal_state->live_handles.push_back(h);
@@ -310,6 +318,7 @@ void HotasReader::start_hid_live() {
             const size_t buf_sz = 64;
             std::vector<uint8_t> rbuf(buf_sz);
             OVERLAPPED ov{}; ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+            
             while (internal_state->live_running.load()) {
                 ResetEvent(ov.hEvent);
                 DWORD read = 0;
@@ -321,18 +330,24 @@ void HotasReader::start_hid_live() {
                         if (w == WAIT_OBJECT_0) {
                             GetOverlappedResult(h, &ov, &read, FALSE);
                         } else {
+                            
                             continue;
                         }
                     } else {
+                        
                         break; // error
                     }
                 }
                 if (read > 0) {
+                    {
+                        
+                    }
                     std::string hex = to_hex(rbuf.data(), read);
                     double ts = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
                     std::lock_guard<std::mutex> g(internal_state->live_mutex);
                     internal_state->live_last[path] = HotasReader::HotasReaderInternalState::LiveEntry{ hex, ts };
                 } else {
+                    
                     // mark as no data yet
                     std::lock_guard<std::mutex> g(internal_state->live_mutex);
                     auto it = internal_state->live_last.find(path);
@@ -341,6 +356,7 @@ void HotasReader::start_hid_live() {
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
             CloseHandle(ov.hEvent);
+            
             // Do not close h here; stop_hid_live will close all handles.
         });
     }
@@ -349,6 +365,7 @@ void HotasReader::start_hid_live() {
 void HotasReader::stop_hid_live() {
     if (!internal_state) return;
     if (!internal_state->live_running.exchange(false)) return;
+    
     // join threads
     for (auto &t : internal_state->live_threads) if (t.joinable()) t.join();
     internal_state->live_threads.clear();
@@ -478,13 +495,14 @@ HotasSnapshot HotasReader::poll_once() {
             if (hex.empty() || hex == "(no data yet)") continue;
             // Require recent updates to avoid using stale data after disconnect
             if (entry.ts <= 0.0 || (now_sec - entry.ts) > fresh_thresh) continue;
-            if (path.find("vid_0738&pid_2221") != std::string::npos && path.find("mi_00") != std::string::npos) {
+            if (path.find("vid_0738&pid_2221") != std::string::npos && (path.find("mi_00") != std::string::npos || path.find("mi_02") != std::string::npos)) {
                 stick_hex = hex;
-            } else if (path.find("vid_0738&pid_a221") != std::string::npos && path.find("mi_00") != std::string::npos) {
+            } else if (path.find("vid_0738&pid_a221") != std::string::npos && (path.find("mi_00") != std::string::npos || path.find("mi_02") != std::string::npos)) {
                 throttle_hex = hex;
             }
         }
     }
+    
 
     std::vector<uint8_t> stick_bytes;
     std::vector<uint8_t> throttle_bytes;
@@ -496,6 +514,7 @@ HotasSnapshot HotasReader::poll_once() {
     // Report ok if any fresh HID data is present (for liveness), but do not synthesize ControllerState here.
     bool any_ok = have_stick || have_throttle;
     snap.ok = any_ok;
+    
 
     return snap;
 }
@@ -508,7 +527,7 @@ bool HotasReader::has_stick() const {
     for (const auto& kv : internal_state->live_last) {
         const std::string& path = kv.first;
         const auto& entry = kv.second;
-        if (path.find("vid_0738&pid_2221") != std::string::npos && path.find("mi_00") != std::string::npos) {
+        if (path.find("vid_0738&pid_2221") != std::string::npos && (path.find("mi_00") != std::string::npos || path.find("mi_02") != std::string::npos)) {
             if (!entry.hex.empty() && entry.hex != "(no data yet)" && entry.ts > 0.0 && (now - entry.ts) <= fresh_thresh) {
                 return true;
             }
@@ -525,7 +544,7 @@ bool HotasReader::has_throttle() const {
     for (const auto& kv : internal_state->live_last) {
         const std::string& path = kv.first;
         const auto& entry = kv.second;
-        if (path.find("vid_0738&pid_a221") != std::string::npos && path.find("mi_00") != std::string::npos) {
+        if (path.find("vid_0738&pid_a221") != std::string::npos && (path.find("mi_00") != std::string::npos || path.find("mi_02") != std::string::npos)) {
             if (!entry.hex.empty() && entry.hex != "(no data yet)" && entry.ts > 0.0 && (now - entry.ts) <= fresh_thresh) {
                 return true;
             }

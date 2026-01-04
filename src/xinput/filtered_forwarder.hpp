@@ -9,8 +9,6 @@
 #include <cstdlib>
 #include <fstream>
 
-// Logging removed: no file loggers retained
-
 // Applies ghost filtering (short pulse suppression & analog spike suppression)
 // before sending to ViGEm.
 class FilteredForwarder : public XInputPoller::IControllerSink {
@@ -161,7 +159,6 @@ public:
             push_btn(Signal::DPadLeft, XINPUT_GAMEPAD_DPAD_LEFT);
             push_btn(Signal::DPadRight, XINPUT_GAMEPAD_DPAD_RIGHT);
             _latest_time_filtered.store(t, std::memory_order_release);
-            // Logging disabled
         }
 
         auto to_short = [](float v){ if (v>1) v=1; if (v<-1) v=-1; return (int16_t)(v>=0? v*32767.0f : v*32768.0f); };

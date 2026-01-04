@@ -29,17 +29,16 @@ static bool g_vigem_ready = false;
 
 static void ensure_vigem_initialized() {
     if (g_vigem_ready) return;
-    if (g_verbose_mapper) { std::cerr << "HotasMapper: initializing ViGEm client...\n"; }
+    // initialize ViGEm client
     g_vigem_client = vigem_alloc();
-    if (!g_vigem_client) return;
+    if (!g_vigem_client) { return; }
     VIGEM_ERROR err = vigem_connect(g_vigem_client);
-    if (!VIGEM_SUCCESS(err)) return;
+    if (!VIGEM_SUCCESS(err)) { return; }
     g_vigem_target = vigem_target_x360_alloc();
-    if (!g_vigem_target) return;
+    if (!g_vigem_target) { return; }
     err = vigem_target_add(g_vigem_client, g_vigem_target);
-    if (!VIGEM_SUCCESS(err)) return;
+    if (!VIGEM_SUCCESS(err)) { return; }
     g_vigem_ready = true;
-    if (g_verbose_mapper) { std::cerr << "HotasMapper: ViGEm client initialized\n"; }
 }
 
 static void cleanup_vigem() {
@@ -165,7 +164,7 @@ void HotasMapper::set_inject_callback(InjectCallback cb) {
 void HotasMapper::start(double target_hz) {
     if (running.exchange(true)) return; // already running
     worker = new std::thread(&HotasMapper::publisher_thread_main, this, target_hz);
-    if (g_verbose_mapper) { std::ostringstream ss; ss << "HotasMapper: started publisher thread at " << target_hz << " Hz"; std::cerr << ss.str() << "\n"; }
+    // started publisher thread
 }
 
 void HotasMapper::stop() {
@@ -238,7 +237,7 @@ bool HotasMapper::save_profile(const std::string& path) const {
     }
     try {
         std::ofstream out(path, std::ios::out | std::ios::trunc);
-        if (!out) return false;
+        if (!out) { return false; }
         out << j.dump(2);
         return true;
     } catch (...) { return false; }
@@ -247,7 +246,7 @@ bool HotasMapper::save_profile(const std::string& path) const {
 bool HotasMapper::load_profile(const std::string& path) {
     try {
         std::ifstream in(path);
-        if (!in) return false;
+        if (!in) { return false; }
         nlohmann::json j; in >> j;
         if (!j.contains("mappings") || !j["mappings"].is_array()) return false;
         std::vector<MappingEntry> loaded;
@@ -397,7 +396,7 @@ void HotasMapper::publisher_thread_main(double hz) {
                 }
                 VIGEM_ERROR err = vigem_target_x360_update(g_vigem_client, g_vigem_target, rep);
                 if (!VIGEM_SUCCESS(err)) {
-                    std::ostringstream ss; ss << "HotasMapper: vigem update failed: " << err; std::cerr << ss.str() << "\n";
+                    // ViGEm update failed; remain silent
                 }
             }
         }

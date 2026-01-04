@@ -55,7 +55,6 @@ void XInputPoller::clear() {
 }
 
 void XInputPoller::inject_state(double t, const ControllerState& state) {
-    // Logging removed
     // Push into rings exactly like the XInput path did
     _rings[(size_t)Signal::LeftX].push(t, state.lx);
     _rings[(size_t)Signal::LeftY].push(t, state.ly);
@@ -105,6 +104,8 @@ void XInputPoller::run(int controller_index) {
     auto wake_time = now_tp + interval_ticks; // first wake
 
     // Polling loop with simple sleep+spin scheduling.
+    bool prev_external = _external_only.load(std::memory_order_relaxed);
+    bool prev_connected = false;
 
     // Simplified scheduling: basic deadline, per-loop stats update, minimal logic.
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL); // keep slight priority bump
@@ -123,7 +124,8 @@ void XInputPoller::run(int controller_index) {
         auto loop_start = clock::now(); // one clock read per loop start
 
         double t = to_double(loop_start); // reuse loop_start time as timestamp
-        if (_external_only.load(std::memory_order_acquire)) {
+        bool ext = _external_only.load(std::memory_order_acquire);
+        if (ext) {
             // When external input is enabled, the poller does not query XInput.
             // Increment stats and wait for next scheduled wake time.
             _connected.store(false, std::memory_order_release);
@@ -171,6 +173,7 @@ void XInputPoller::run(int controller_index) {
             continue;
         }
         _connected.store(true, std::memory_order_release);
+        prev_connected = _connected.load(std::memory_order_relaxed);
 
         const XINPUT_GAMEPAD &gp = state.Gamepad;
         // Inline axis normalization to avoid lambda overhead (minor but keeps hot loop lean)
