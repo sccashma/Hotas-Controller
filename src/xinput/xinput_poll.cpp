@@ -3,6 +3,7 @@
 #include <Xinput.h>
 #include <chrono>
 #include <cmath>
+#include <fstream>
 #if defined(_MSC_VER) || defined(__clang__) || defined(__GNUG__)
 #include <immintrin.h>
 #endif
@@ -53,6 +54,39 @@ void XInputPoller::clear() {
     _latest_time.store(0.0, std::memory_order_release);
 }
 
+void XInputPoller::inject_state(double t, const ControllerState& state) {
+    // Logging removed
+    // Push into rings exactly like the XInput path did
+    _rings[(size_t)Signal::LeftX].push(t, state.lx);
+    _rings[(size_t)Signal::LeftY].push(t, state.ly);
+    _rings[(size_t)Signal::RightX].push(t, state.rx);
+    _rings[(size_t)Signal::RightY].push(t, state.ry);
+    _rings[(size_t)Signal::LeftTrigger].push(t, state.lt);
+    _rings[(size_t)Signal::RightTrigger].push(t, state.rt);
+    WORD buttons = state.buttons;
+    auto push_btn = [&](Signal s, WORD mask){ _rings[(size_t)s].push(t, (buttons & mask) ? 1.0f : 0.0f); };
+    push_btn(Signal::LeftShoulder, XINPUT_GAMEPAD_LEFT_SHOULDER);
+    push_btn(Signal::RightShoulder, XINPUT_GAMEPAD_RIGHT_SHOULDER);
+    push_btn(Signal::A, XINPUT_GAMEPAD_A);
+    push_btn(Signal::B, XINPUT_GAMEPAD_B);
+    push_btn(Signal::X, XINPUT_GAMEPAD_X);
+    push_btn(Signal::Y, XINPUT_GAMEPAD_Y);
+    push_btn(Signal::StartBtn, XINPUT_GAMEPAD_START);
+    push_btn(Signal::BackBtn, XINPUT_GAMEPAD_BACK);
+    push_btn(Signal::LeftThumbBtn, XINPUT_GAMEPAD_LEFT_THUMB);
+    push_btn(Signal::RightThumbBtn, XINPUT_GAMEPAD_RIGHT_THUMB);
+    push_btn(Signal::DPadUp, XINPUT_GAMEPAD_DPAD_UP);
+    push_btn(Signal::DPadDown, XINPUT_GAMEPAD_DPAD_DOWN);
+    push_btn(Signal::DPadLeft, XINPUT_GAMEPAD_DPAD_LEFT);
+    push_btn(Signal::DPadRight, XINPUT_GAMEPAD_DPAD_RIGHT);
+
+    // Forward to sink if present
+    if (auto* sink = _sink.load(std::memory_order_acquire)) {
+        sink->process(t, state);
+    }
+    _latest_time.store(t, std::memory_order_release);
+}
+
 void XInputPoller::run(int controller_index) {
     using clock = std::chrono::steady_clock;
     auto to_double = [](clock::time_point tp){ return std::chrono::duration<double>(tp.time_since_epoch()).count(); };
@@ -88,12 +122,51 @@ void XInputPoller::run(int controller_index) {
 
         auto loop_start = clock::now(); // one clock read per loop start
 
-        XINPUT_STATE state{}; DWORD res = XInputGetState(controller_index, &state);
         double t = to_double(loop_start); // reuse loop_start time as timestamp
+        if (_external_only.load(std::memory_order_acquire)) {
+            // When external input is enabled, the poller does not query XInput.
+            // Increment stats and wait for next scheduled wake time.
+            _connected.store(false, std::memory_order_release);
+            last_sample_time = t;
+            window_polls++;
+            _samples_captured.fetch_add(1, std::memory_order_release);
+            auto now_after = clock::now();
+            double now_sec_d = to_double(now_after);
+            if (now_sec_d - window_start_time >= 0.1) {
+                double elapsed = now_sec_d - window_start_time;
+                double eff = (elapsed > 0.0) ? (double)window_polls / elapsed : 0.0;
+                PollStats ps{};
+                ps.effective_hz = eff;
+                ps.avg_loop_us = ema_loop_us;
+                _stats.store(ps, std::memory_order_release);
+                window_start_time = now_sec_d;
+                window_polls = 0;
+            }
+            // Sleep+spin to maintain 1 kHz rate (same as normal path)
+            auto before_wait = clock::now();
+            auto sleep_time = wake_time - std::chrono::microseconds(800);
+            if (before_wait < sleep_time) {
+                std::this_thread::sleep_until(sleep_time);
+            }
+            while (clock::now() < wake_time) {
+#if defined(__SSE2__) || defined(_M_X64) || defined(_M_IX86_FP)
+                _mm_pause();
+#endif
+            }
+            // Advance deadline in fixed steps
+            wake_time += interval_ticks;
+            auto now_after_wait = clock::now();
+            if (now_after_wait > wake_time + interval_ticks) {
+                wake_time = now_after_wait + interval_ticks; // drift correction
+            }
+            continue;
+        }
+        XINPUT_STATE state{}; DWORD res = XInputGetState(controller_index, &state);
+        double t2 = to_double(loop_start);
         if (res != ERROR_SUCCESS) {
             _connected.store(false, std::memory_order_release);
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            last_sample_time = t;
+            last_sample_time = t2;
             wake_time = clock::now() + interval_ticks;
             continue;
         }
@@ -147,6 +220,7 @@ void XInputPoller::run(int controller_index) {
         last_sample_time = t;
         _latest_time.store(t, std::memory_order_release);
         window_polls++;
+        _samples_captured.fetch_add(1, std::memory_order_release);
 
         auto loop_us_ll = std::chrono::duration_cast<std::chrono::microseconds>(work_end - loop_start).count();
         double loop_us = static_cast<double>(loop_us_ll);
@@ -156,7 +230,7 @@ void XInputPoller::run(int controller_index) {
         // Simple sleep+spin: sleep for remaining, then spin to deadline.
         // Sleep until scheduled wake time (coarse) then spin if a little early
         auto before_wait = clock::now();
-        auto sleep_time = wake_time - clock::duration( std::chrono::microseconds(800) ); 
+        auto sleep_time = wake_time - std::chrono::microseconds(800); 
         if (before_wait < sleep_time) {
             std::this_thread::sleep_until(sleep_time);
         }

@@ -59,6 +59,10 @@ public:
 
     void snapshot(Signal sig, std::vector<Sample>& out) const;
     void snapshot_with_baseline(Signal sig, std::vector<Sample>& out) const;
+    // Inject an externally-sourced controller state (e.g. HOTAS reader) into the poller.
+    // This will push samples to the internal rings and notify any sink exactly as if
+    // the poller had read them itself.
+    void inject_state(double t, const ControllerState& state);
     void set_target_hz(double hz) {
         if (hz < 10.0) hz = 10.0; // sensible floor
         if (hz > 8000.0) hz = 8000.0; // clamp ceiling
@@ -68,6 +72,8 @@ public:
     double window_seconds() const { return _window_seconds.load(std::memory_order_acquire); }
     void clear();
     void set_sink(IControllerSink* sink) { _sink.store(sink, std::memory_order_release); }
+    void set_external_input(bool v) { _external_only.store(v, std::memory_order_release); }
+    uint64_t samples_captured() const { return _samples_captured.load(std::memory_order_acquire); }
 
 private:
     void run(int controller_index);
@@ -82,4 +88,6 @@ private:
     std::array<SampleRing, SignalCount> _rings; // sized by capacity
     std::atomic<IControllerSink*> _sink{nullptr};
     std::atomic<int> _controller_index{0};
+    std::atomic<bool> _external_only{false};
+    std::atomic<uint64_t> _samples_captured{0}; // total samples processed by polling thread
 };
