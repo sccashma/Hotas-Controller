@@ -1,146 +1,75 @@
-# Hotas Controller
+# X56 HOTAS Controller
 
-High‑frequency polling, visualization, and filtering of Xbox (XInput) controller signals. The goal is to detect/suppress ghost inputs (short unintended digital pulses & large analog spikes) and optionally forward a cleaned state to a virtual Xbox 360 device via ViGEm.
+Map your Logitech X56 HOTAS to game inputs with clean, reliable behavior.
 
-The active implementation is native C++ using Dear ImGui + ImPlot. A legacy Python prototype exists only for historical reference.
+This app reads your HOTAS at a fixed 1,000 samples per second, filters out ghost inputs, and lets you map any HOTAS button/axis to:
+- Virtual Xbox 360 controller (ViGEm)
+- Keyboard keys
+- Mouse actions
 
-## Quick Highlights
-* Adjustable polling rate (clamped 10–8000 Hz) with live effective Hz and loop cost stats.
-* Rolling window plots (configurable seconds) for every signal.
-* Per‑signal enable/disable of filtering (spike & short‑pulse suppression).
-* Gated digital filtering: presses must reach a minimum duration before promotion.
-* Analog spike suppression using absolute delta thresholds.
-* Optional virtual Xbox 360 output when ViGEm client & driver are available.
-* Persistent settings (`config/filter_settings.cfg`) for filter + runtime parameters.
-* Automatic three‑column dock layout (Control | Raw Signals | Filtered Signals).
+You get live graphs for raw and filtered signals, so you can see exactly what the device is doing and what the filter is producing.
 
-## Signal Names
-Enumeration in `src/xinput/xinput_poll.hpp` (used in config keys):
-```
-left_x, left_y, right_x, right_y,
-left_trigger, right_trigger,
-left_shoulder, right_shoulder,
-a, b, x, y, start, back, left_thumb, right_thumb,
-dpad_up, dpad_down, dpad_left, dpad_right
-```
+## What You Need
+- Windows 10 or 11
+- Logitech X56 HOTAS plugged in
+- Optional (for virtual controller): ViGEmBus driver
 
-## Filtering Overview
-Digital inputs follow a pending→promoted state machine (see `filtered_forwarder.hpp`). A rising edge starts a timer; only after the press lasts ≥ `digital_max_ms` is it promoted (visible). Releases prior to promotion are fully suppressed.
+## Install & Run
+Option A — Download (recommended for end users):
+- Grab the latest prebuilt `hotas_controller.exe` from the Releases page and run it.
+- The app ships with its required libraries; no separate dependency install.
 
-Analog inputs apply spike suppression per axis: if `|current - previous| >= analog_delta` and filtering for that signal is enabled, the value is clamped to the previous sample. Triggers can be toggled to digital mode individually (UI checkboxes) to join the gated path.
-
-## Requirements
-* Windows 10/11
-* Visual Studio 2022 (MSVC) or Build Tools + CMake ≥ 3.25
-* DirectX 11 & XInput libraries (provided by VS install)
-* Optional: ViGEmBus driver + client (submodule) for virtual output
-
-## Build
-Default CMake options (see [CMakeLists.txt](CMakeLists.txt)):
-* `BUILD_STATIC` = OFF (set ON to link static MSVC runtime)
-* `WITH_DEMOS`  = OFF (set ON to include ImGui/ImPlot demo windows)
-
-Release build:
+Option B — Build from source (advanced users):
 ```powershell
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release --target hotas_controller
+./build/Release/hotas_controller.exe
 ```
+- The build scripts fetch and build dependencies automatically (ImGui, ImPlot, nlohmann/json, etc.).
+- ViGEm client is integrated; if the ViGEmBus driver is present, the Virtual Output will show Ready. If not, virtual output is disabled gracefully.
 
-Binary: `build/Release/hotas_controller.exe`
-Runtime config directory: `build/Release/config/`
-- Contains `filter_settings.cfg`, `mappings.json`, and `X56_Hotas_hid_bit_map.csv` copied from [res/config](res/config).
-- The application loads and saves these files from `config/` next to the executable.
+## Quick Start
+- Plug in the HOTAS and launch the app.
+- In Control:
+	- Set Window (seconds) for how much history to show.
+	- Turn on Filter Mode and pick parameters:
+		- Analog Rate Limit: 0–100% per sample (smooths axes)
+		- Digital Pulse Max (ms): minimum press length to count (debounce)
+	- Choose per‑input filter mode (None/Digital/Analog) for each HOTAS signal.
+- Open Mappings:
+	- Pick a HOTAS signal (Stick/Throttle, including HAT directions and POV).
+	- Choose Action Type: x360, keyboard, or mouse.
+	- For axes, set a small Deadband (e.g., 0.05) and Priority (higher wins).
+	- Click Add Mapping, then Save Profile to persist.
+- Optional: enable Virtual Output to publish a virtual Xbox 360 pad via ViGEm.
 
-MSVC security / hardening flags applied: `/sdl`, `/guard:cf`, `/DYNAMICBASE`, `/NXCOMPAT`.
+## How Filtering Works
+- Digital (buttons, toggles): requires a press to last at least `Digital Pulse Max` before it “promotes” and appears; shorter pulses are ignored.
+- Analog (axes): limits the maximum change per sample by a percentage of the input’s full range.
+	- Axes normalized to −1..1 use a 2.0 full range.
+	- Raw analog inputs use their bit‑range (e.g., 0..65535).
+- Triggers can be treated as digital or analog separately.
 
-### Submodules
-Initialize ViGEm client if using virtual output:
-```powershell
-git submodule update --init --recursive
-```
+## Keyboard & Mouse Mapping
+- Keyboard events use scan codes (not just virtual keys) so browsers/games receive a proper `code` like KeyV.
+- Use simple names (e.g., `VK_SPACE`, `A`) in the Mappings UI.
+- Mouse actions include clicks and movement.
 
-### Configuration File
-`config/filter_settings.cfg` (created/saved by explicit **Save Settings** action) contains:
-```
-enabled=0|1
-analog_delta=<float>
-analog_return=<float>
-digital_max_ms=<double>
-target_hz=<double>
-window_seconds=<double>
-virtual_output=0|1
-left_trigger_digital=0|1
-right_trigger_digital=0|1
-filter_<signal_name>=0|1   (per signal)
-```
-No automatic save on exit; use **Save Settings** to persist changes.
+## Settings & Profiles
+- Click Save Settings to write filter/runtime options to `config/filter_settings.cfg`.
+- Click Save Profile in Mappings to write HOTAS→action pairs to `config/mappings.json`.
+- No auto‑save on exit (you control when to save).
 
-## UI Panels
-* **Control**: stats, controller index selection, Hz & window adjustments, filter toggles, per‑signal overrides, save/revert, virtual output toggle (enabled only when backend is `Ready`).
-* **Raw Signals**: direct polled values.
-* **Filtered Signals**: post‑filter state (gating + spike suppression).
+## Tips
+- If Virtual Output is disabled, install ViGEmBus; the client library is built along with the app.
+- Use the per‑signal filter table to apply Digital to noisy buttons and Analog to jittery axes.
+- Test keyboard mappings at the W3C Key Event Viewer (the `code` field should be set).
 
-## Key Source Files
-* `src/main.cpp` – Win32 & DX11 init, ImGui/ImPlot setup, docking layout, settings I/O.
-* `src/xinput/xinput_poll.*` – polling loop, sample capture, stats.
-* `src/xinput/filtered_forwarder.hpp` – filtering logic + ViGEm forwarding.
-* `src/ui/plots_panel.*` – plot generation & step series creation.
-* `src/core/ring_buffer.hpp` – storage for high‑rate sample history.
-* `external/ViGEmClient/` – ViGEm client library (submodule).
-* CSV descriptor source: [res/config/X56_Hotas_hid_bit_map.csv](res/config/X56_Hotas_hid_bit_map.csv) – loaded at runtime; becomes [build/Release/config/X56_Hotas_hid_bit_map.csv](build/Release/config/X56_Hotas_hid_bit_map.csv).
-
-## Performance Notes
-* Very high target rates (> 4 kHz) may be CPU intensive; the loop uses sleep + short spin to hit deadlines.
-* Each signal stores samples in a ring sized at `1<<19` entries to accommodate large windows at high rates.
-
-## Troubleshooting
-| Issue | Suggestions |
-|-------|------------|
-| Virtual output toggle disabled | ViGEmBus driver or client missing; ensure submodule built and driver installed; status should be `Ready`. |
-| High CPU usage | Lower `target_hz`; disable demos; reduce window length. |
-
-## Versioning
-`res/version.h` + `res/version.rc` embed version and manifest (if present) in the binary. Edit before releases.
+## Known Limits
+- Polling is fixed at 1 kHz and independent of UI frame rate.
+- History is stored in fixed‑size rings to keep memory bounded.
+- Filter modes are mutually exclusive per signal.
+- UI stays in three panes (Control | Raw | Filtered).
 
 ## License
-MIT – see `LICENSE`.
-
-## Disclaimer
-High polling rates and spin waits increase power usage. Choose rates appropriate for diagnostics, not continuous background use.
-
-## Mappings (HOTAS → Action)
-
-Configure how HOTAS signals map to output actions via the UI or by editing the JSON profile.
-
-Quick steps (UI)
-- Open Edit → Mappings in the app (see UI in [`src/main.cpp`](src/main.cpp)).
-- Device: choose All / Stick / Throttle.
-- Signal: populated from the runtime HOTAS signal list (`[`HotasReader::list_signals`](src/xinput/hotas_reader.cpp)` / [`src/xinput/hotas_reader.hpp`](src/xinput/hotas_reader.hpp)`).
-- Action Type: select one of:
-  - x360 — maps to a virtual Xbox 360 input (labels defined in [`src/main.cpp`](src/main.cpp))
-  - keyboard — sends key (e.g. "VK_SPACE" or 'A'); use the new visual keyboard picker ("Pick...") next to the field to choose keys without typing codes
-  - mouse — sends mouse actions (e.g. left_click)
-- Click "Add Mapping" to create the mapping; use Save/Load to persist via the UI (calls [`HotasMapper::save_profile`](src/xinput/hotas_mapper.cpp) / [`HotasMapper::load_profile`](src/xinput/hotas_mapper.cpp)).
-
-Mapping internals
-- A mapping is represented by [`MappingEntry`](src/xinput/hotas_mapper.hpp) and stored/loaded as JSON in `config/mappings.json` (default in [res/config/mappings.json](res/config/mappings.json)).
-- New logical samples are fed into the mapper via [`HotasMapper::accept_sample`](src/xinput/hotas_mapper.cpp) (called from the HOTAS raw parser / UI code).
-- The mapper publishes mapped X360 reports at its publish rate and uses ViGEm to emit a virtual controller (see [`src/xinput/hotas_mapper.cpp`](src/xinput/hotas_mapper.cpp) and the ViGEm client submodule at [`external/ViGEmClient`](external/ViGEmClient)).
-
-Injection flow (high level)
-- HOTAS raw reports → parsed by [`HotasReader::get_hid_live_snapshot` / `list_signals`](src/xinput/hotas_reader.cpp) using descriptors from `config/X56_Hotas_hid_bit_map.csv` → logical values passed to [`HotasMapper::accept_sample`](src/xinput/hotas_mapper.cpp) → mapper publishes to virtual device (ViGEm) in [`HotasMapper::publisher_thread_main`](src/xinput/hotas_mapper.cpp).
-- The UI wires mapper injection into the app poller via [`HotasMapper::set_inject_callback`](src/xinput/hotas_mapper.cpp) / the call in [`src/main.cpp`](src/main.cpp) which injects mapped states into the `XInputPoller` for filtering/forwarding.
-
-File references
-- UI wiring / Mappings dialog: [`src/main.cpp`](src/main.cpp)
-- Mapper interface & MappingEntry: [`src/xinput/hotas_mapper.hpp`](src/xinput/hotas_mapper.hpp)
-- Mapper implementation (save/load/publish): [`src/xinput/hotas_mapper.cpp`](src/xinput/hotas_mapper.cpp)
-- HOTAS signal discovery & HID live: [`src/xinput/hotas_reader.hpp`](src/xinput/hotas_reader.hpp) / [`src/xinput/hotas_reader.cpp`](src/xinput/hotas_reader.cpp)
-- Example mapping profile: [`mappings.json`](mappings.json)
-- Virtual output (ViGEm) client code: [`external/ViGEmClient`](external/ViGEmClient)
-
-Notes & tips
-- Use the device filter to reduce the signal list to Stick or Throttle when authoring mappings.
-- The keyboard picker mirrors a standard US layout and fills the field with supported names (VK_* constants or single characters). Keys auto‑repeat while held based on system keyboard settings.
-- After editing `mappings.json` manually, use Load in the Mappings UI to apply.
-- If ViGEm is not Ready the x360 action targets will not be emitted; check ViGEm status in the Control panel (see [`src/xinput/hotas_mapper.cpp`](src/xinput/hotas_mapper.cpp) and [`external/ViGEmClient`](external/ViGEmClient)).
+MIT — see [LICENSE](LICENSE).
