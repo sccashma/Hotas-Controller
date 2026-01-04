@@ -22,7 +22,7 @@ BEGIN
             VALUE "FileDescription", APP_FILEDESC "\0"
             VALUE "FileVersion", APP_VERSION_STR "\0"
             VALUE "InternalName", APP_INTERNAL "\0"
-            VALUE "OriginalFilename", "xinput_plotter.exe\0"
+            VALUE "OriginalFilename", "hotas_controller.exe\0"
             VALUE "ProductName", APP_FILEDESC "\0"
             VALUE "ProductVersion", APP_VERSION_STR "\0"
             VALUE "LegalCopyright", APP_COPYRIGHT "\0"

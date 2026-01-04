@@ -454,22 +454,7 @@ static bool hex_to_bytes(const std::string& hex, std::vector<uint8_t>& out) {
     return !out.empty();
 }
 
-// Helper: extract `bits` starting at `bit_start` (LSB-first within bytes)
-static uint64_t extract_bits_lsb_first(const std::vector<uint8_t>& bytes, int bit_start, int bits) {
-    if (bits <= 0) return 0;
-    uint64_t val = 0;
-    int last_bit = bit_start + bits - 1;
-    size_t needed_bytes = (static_cast<size_t>(last_bit) / 8) + 1;
-    if (bytes.size() < needed_bytes) return 0;
-    for (int i = 0; i < bits; ++i) {
-        int bit_global = bit_start + i;
-        size_t byte_idx = static_cast<size_t>(bit_global) / 8;
-        int bit_in_byte = bit_global % 8; // LSB-first
-        int bitv = (bytes[byte_idx] >> bit_in_byte) & 1;
-        val |= (uint64_t(bitv) << i);
-    }
-    return val;
-}
+ 
 
 // Poll devices and synthesize a ControllerState from latest HID reports.
 // Uses live_last_hex captured by start_hid_live(); runs independent of UI focus.

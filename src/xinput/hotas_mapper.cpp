@@ -369,7 +369,11 @@ void HotasMapper::publisher_thread_main(double hz) {
             // Before sending the report, optionally call the inject callback with a mapped ControllerState
             if (g_inject_cb) {
                 XInputPoller::ControllerState cs{};
-                auto to_float = [](int16_t s)->float { return (s >= 0) ? (double)s / 32767.0 : (double)s / 32768.0; };
+                auto to_float = [](int16_t s)->float {
+                    return (s >= 0)
+                        ? static_cast<float>(static_cast<double>(s) / 32767.0)
+                        : static_cast<float>(static_cast<double>(s) / 32768.0);
+                };
                 cs.lx = to_float(rep.sThumbLX);
                 cs.ly = -to_float(rep.sThumbLY);
                 cs.rx = to_float(rep.sThumbRX);

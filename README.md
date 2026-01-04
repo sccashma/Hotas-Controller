@@ -1,5 +1,7 @@
 # X56 HOTAS Controller
 
+Status: Beta (1.0.0-beta)
+
 Map your Logitech X56 HOTAS to game inputs with clean, reliable behavior.
 
 This app reads your HOTAS at a fixed 1,000 samples per second, filters out ghost inputs, and lets you map any HOTAS button/axis to:
@@ -73,3 +75,9 @@ cmake --build build --config Release --target hotas_controller
 
 ## License
 MIT — see [LICENSE](LICENSE).
+
+## Beta Notes (1.0.0-beta)
+- First public beta with fixed 1 kHz polling, per-signal filtering, and ViGEm virtual controller integration.
+- Version metadata embedded in the executable (File/Product Version: 1.0.0-beta).
+- Settings persist to `config/filter_settings.cfg`; mappings to `config/mappings.json`.
+- Please report issues with device enumeration, filtering behavior, or virtual output readiness.

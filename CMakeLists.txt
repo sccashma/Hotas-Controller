@@ -124,6 +124,15 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE IMGUI_ENABLE_DOCKING)
 target_include_directories(${PROJECT_NAME} PRIVATE src)
 target_include_directories(${PROJECT_NAME} PRIVATE ${nlohmann_json_SOURCE_DIR}/include)
 
+# Silence warnings from external libraries to keep build output actionable
+if (MSVC)
+    foreach(tgt IN ITEMS ViGEmClient lunasvg plutovg)
+        if (TARGET ${tgt})
+            target_compile_options(${tgt} PRIVATE /W0)
+        endif()
+    endforeach()
+endif()
+
 # Enable higher optimization for release
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
