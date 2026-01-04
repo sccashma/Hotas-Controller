@@ -20,17 +20,7 @@ HotasMapper::HotasMapper() {}
 HotasMapper::~HotasMapper() { stop(); }
 
 // Enable verbose diagnostics for mapper (set true to print mapping and vigem events)
-static bool g_verbose_mapper = true; // enable by default during debugging
-// Simple file logger to persist diagnostics when running as GUI
-static std::mutex g_log_mtx;
-static void mapper_log(const std::string &s) {
-    std::lock_guard<std::mutex> lk(g_log_mtx);
-    // append to logfile in executable directory
-    std::ofstream out("hotas_mapper.log", std::ios::out | std::ios::app);
-    if (!out) return;
-    out << s;
-    if (s.empty() || s.back() != '\n') out << '\n';
-}
+static bool g_verbose_mapper = false; // disable verbose mapper logging
 
 // ViGEm client (single global target used by the mapper)
 static PVIGEM_CLIENT g_vigem_client = nullptr;
@@ -39,7 +29,7 @@ static bool g_vigem_ready = false;
 
 static void ensure_vigem_initialized() {
     if (g_vigem_ready) return;
-    if (g_verbose_mapper) { std::cerr << "HotasMapper: initializing ViGEm client...\n"; mapper_log("HotasMapper: initializing ViGEm client..."); }
+    if (g_verbose_mapper) { std::cerr << "HotasMapper: initializing ViGEm client...\n"; }
     g_vigem_client = vigem_alloc();
     if (!g_vigem_client) return;
     VIGEM_ERROR err = vigem_connect(g_vigem_client);
@@ -49,7 +39,7 @@ static void ensure_vigem_initialized() {
     err = vigem_target_add(g_vigem_client, g_vigem_target);
     if (!VIGEM_SUCCESS(err)) return;
     g_vigem_ready = true;
-    if (g_verbose_mapper) { std::cerr << "HotasMapper: ViGEm client initialized\n"; mapper_log("HotasMapper: ViGEm client initialized"); }
+    if (g_verbose_mapper) { std::cerr << "HotasMapper: ViGEm client initialized\n"; }
 }
 
 static void cleanup_vigem() {
@@ -156,7 +146,7 @@ void HotasMapper::set_inject_callback(InjectCallback cb) {
 void HotasMapper::start(double target_hz) {
     if (running.exchange(true)) return; // already running
     worker = new std::thread(&HotasMapper::publisher_thread_main, this, target_hz);
-    if (g_verbose_mapper) { std::ostringstream ss; ss << "HotasMapper: started publisher thread at " << target_hz << " Hz"; std::cerr << ss.str() << "\n"; mapper_log(ss.str()); }
+    if (g_verbose_mapper) { std::ostringstream ss; ss << "HotasMapper: started publisher thread at " << target_hz << " Hz"; std::cerr << ss.str() << "\n"; }
 }
 
 void HotasMapper::stop() {
@@ -180,7 +170,7 @@ void HotasMapper::accept_sample(const std::string& signal_id, double value, doub
     std::lock_guard<std::mutex> lk(mtx);
     pending_samples.emplace_back(signal_id, value, timestamp);
     if (g_verbose_mapper) {
-        std::ostringstream ss; ss << "HotasMapper: accepted sample " << signal_id << "=" << value << " ts=" << timestamp; std::cerr << ss.str() << "\n"; mapper_log(ss.str());
+        std::ostringstream ss; ss << "HotasMapper: accepted sample " << signal_id << "=" << value << " ts=" << timestamp; std::cerr << ss.str() << "\n";
     }
 }
 
@@ -196,8 +186,10 @@ std::vector<MappingEntry> HotasMapper::list_mapping_entries() const {
 
 bool HotasMapper::add_mapping(const MappingEntry& e) {
     std::lock_guard<std::mutex> lk(mtx);
-    // Ensure unique id
-    for (auto &m : g_mappings) if (m.id == e.id) return false;
+    // Overwrite if id exists; else append
+    for (auto &m : g_mappings) {
+        if (m.id == e.id) { m = e; return true; }
+    }
     g_mappings.push_back(e);
     return true;
 }
@@ -220,6 +212,8 @@ bool HotasMapper::save_profile(const std::string& path) const {
             jm["id"] = m.id;
             jm["signal_id"] = m.signal_id;
             jm["action"] = m.action;
+            jm["priority"] = m.priority;
+            jm["deadband"] = m.deadband;
             j["mappings"].push_back(jm);
         }
     }
@@ -243,6 +237,19 @@ bool HotasMapper::load_profile(const std::string& path) {
             if (jm.contains("id")) me.id = jm["id"].get<std::string>();
             if (jm.contains("signal_id")) me.signal_id = jm["signal_id"].get<std::string>();
             if (jm.contains("action")) me.action = jm["action"].get<std::string>();
+            if (jm.contains("priority")) me.priority = jm["priority"].get<int>();
+            // For analog actions, deadband must be present; if missing, apply a sensible default
+            if (jm.contains("deadband")) me.deadband = jm["deadband"].get<double>();
+            else {
+                // default only for analog actions
+                std::string act = me.action;
+                if (act.rfind("x360:",0) == 0) {
+                    std::string a = act.substr(5);
+                    if (a == "left_x" || a == "left_y" || a == "right_x" || a == "right_y" || a == "left_trigger" || a == "right_trigger") {
+                        me.deadband = 0.05; // default deadband
+                    }
+                }
+            }
             loaded.push_back(me);
         }
         std::lock_guard<std::mutex> lk(mtx);
@@ -273,76 +280,72 @@ void HotasMapper::publisher_thread_main(double hz) {
         // Build and send x360 report if any mappings target x360
         if (!g_mappings.empty()) {
             XUSB_REPORT rep{};
-            // helper conversions
             auto to_short = [](double v){ double vv = v; if (vv>1) vv=1; if (vv<-1) vv=-1; return (int16_t)(vv>=0? vv*32767.0 : vv*32768.0); };
             auto to_trig = [](double v){ double vv = v; if (vv<0) vv=0; if (vv>1) vv=1; return (uint8_t)(vv*255.0 + 0.5); };
-            uint16_t button_mask = 0;
-            for (auto &m : g_mappings) {
-                if (m.action.rfind("x360:",0) != 0) continue;
-                std::string act = m.action.substr(5);
-                // axes
-                if (act == "left_x") {
-                    double v = curvals.count(m.signal_id) ? curvals[m.signal_id] : 0.0;
-                    rep.sThumbLX = to_short(v);
-                } else if (act == "left_y") {
-                    double v = curvals.count(m.signal_id) ? curvals[m.signal_id] : 0.0;
-                    rep.sThumbLY = to_short(-v);
-                } else if (act == "right_x") {
-                    double v = curvals.count(m.signal_id) ? curvals[m.signal_id] : 0.0;
-                    rep.sThumbRX = to_short(v);
-                } else if (act == "right_y") {
-                    double v = curvals.count(m.signal_id) ? curvals[m.signal_id] : 0.0;
-                    rep.sThumbRY = to_short(-v);
-                } else if (act == "left_trigger") {
-                    double v = curvals.count(m.signal_id) ? curvals[m.signal_id] : 0.0;
-                    rep.bLeftTrigger = to_trig(v);
-                } else if (act == "right_trigger") {
-                    double v = curvals.count(m.signal_id) ? curvals[m.signal_id] : 0.0;
-                    rep.bRightTrigger = to_trig(v);
-                } else if (act == "button_a") {
-                    double v = curvals.count(m.signal_id) ? curvals[m.signal_id] : 0.0;
-                    if (v > 0.5) button_mask |= XINPUT_GAMEPAD_A;
-                } else if (act == "button_b") {
-                    double v = curvals.count(m.signal_id) ? curvals[m.signal_id] : 0.0;
-                    if (v > 0.5) button_mask |= XINPUT_GAMEPAD_B;
-                } else if (act == "button_x") {
-                    double v = curvals.count(m.signal_id) ? curvals[m.signal_id] : 0.0;
-                    if (v > 0.5) button_mask |= XINPUT_GAMEPAD_X;
-                } else if (act == "button_y") {
-                    double v = curvals.count(m.signal_id) ? curvals[m.signal_id] : 0.0;
-                    if (v > 0.5) button_mask |= XINPUT_GAMEPAD_Y;
-                } else if (act == "left_shoulder") {
-                    double v = curvals.count(m.signal_id) ? curvals[m.signal_id] : 0.0;
-                    if (v > 0.5) button_mask |= XINPUT_GAMEPAD_LEFT_SHOULDER;
-                } else if (act == "right_shoulder") {
-                    double v = curvals.count(m.signal_id) ? curvals[m.signal_id] : 0.0;
-                    if (v > 0.5) button_mask |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
-                } else if (act == "back") {
-                    double v = curvals.count(m.signal_id) ? curvals[m.signal_id] : 0.0;
-                    if (v > 0.5) button_mask |= XINPUT_GAMEPAD_BACK;
-                } else if (act == "start") {
-                    double v = curvals.count(m.signal_id) ? curvals[m.signal_id] : 0.0;
-                    if (v > 0.5) button_mask |= XINPUT_GAMEPAD_START;
-                } else if (act == "left_thumb") {
-                    double v = curvals.count(m.signal_id) ? curvals[m.signal_id] : 0.0;
-                    if (v > 0.5) button_mask |= XINPUT_GAMEPAD_LEFT_THUMB;
-                } else if (act == "right_thumb") {
-                    double v = curvals.count(m.signal_id) ? curvals[m.signal_id] : 0.0;
-                    if (v > 0.5) button_mask |= XINPUT_GAMEPAD_RIGHT_THUMB;
-                } else if (act == "dpad_up") {
-                    double v = curvals.count(m.signal_id) ? curvals[m.signal_id] : 0.0;
-                    if (v > 0.5) button_mask |= XINPUT_GAMEPAD_DPAD_UP;
-                } else if (act == "dpad_down") {
-                    double v = curvals.count(m.signal_id) ? curvals[m.signal_id] : 0.0;
-                    if (v > 0.5) button_mask |= XINPUT_GAMEPAD_DPAD_DOWN;
-                } else if (act == "dpad_left") {
-                    double v = curvals.count(m.signal_id) ? curvals[m.signal_id] : 0.0;
-                    if (v > 0.5) button_mask |= XINPUT_GAMEPAD_DPAD_LEFT;
-                } else if (act == "dpad_right") {
-                    double v = curvals.count(m.signal_id) ? curvals[m.signal_id] : 0.0;
-                    if (v > 0.5) button_mask |= XINPUT_GAMEPAD_DPAD_RIGHT;
+            // Group mappings by action
+            std::unordered_map<std::string, std::vector<MappingEntry>> groups;
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                for (const auto &m : g_mappings) {
+                    if (m.action.rfind("x360:",0) != 0) continue;
+                    groups[m.action].push_back(m);
                 }
             }
+            auto read_val = [&](const std::string &sid)->double {
+                auto it = curvals.find(sid);
+                return (it != curvals.end()) ? it->second : 0.0;
+            };
+            auto resolve_axis = [&](const std::vector<MappingEntry>& vec)->double {
+                if (vec.empty()) return 0.0;
+                // sort by priority desc
+                std::vector<MappingEntry> tmp = vec;
+                std::sort(tmp.begin(), tmp.end(), [](const MappingEntry& a, const MappingEntry& b){ return a.priority > b.priority; });
+                double fallback_max = 0.0; double fallback_val = 0.0;
+                for (const auto &m : tmp) {
+                    double v = read_val(m.signal_id);
+                    double mag = std::fabs(v);
+                    if (mag > m.deadband) {
+                        return v; // first above deadband wins by priority
+                    }
+                    if (mag > fallback_max) { fallback_max = mag; fallback_val = v; }
+                }
+                return fallback_val; // none above deadband: use largest magnitude
+            };
+            auto resolve_button = [&](const std::vector<MappingEntry>& vec)->bool {
+                if (vec.empty()) return false;
+                std::vector<MappingEntry> tmp = vec;
+                std::sort(tmp.begin(), tmp.end(), [](const MappingEntry& a, const MappingEntry& b){ return a.priority > b.priority; });
+                for (const auto &m : tmp) {
+                    double v = read_val(m.signal_id);
+                    if (v > 0.5) return true; // first active wins
+                }
+                return false;
+            };
+
+            // Axes
+            if (groups.count("x360:left_x")) rep.sThumbLX = to_short(resolve_axis(groups["x360:left_x"]));
+            if (groups.count("x360:left_y")) rep.sThumbLY = to_short(-resolve_axis(groups["x360:left_y"]));
+            if (groups.count("x360:right_x")) rep.sThumbRX = to_short(resolve_axis(groups["x360:right_x"]));
+            if (groups.count("x360:right_y")) rep.sThumbRY = to_short(-resolve_axis(groups["x360:right_y"]));
+            if (groups.count("x360:left_trigger")) rep.bLeftTrigger = to_trig(resolve_axis(groups["x360:left_trigger"]));
+            if (groups.count("x360:right_trigger")) rep.bRightTrigger = to_trig(resolve_axis(groups["x360:right_trigger"]));
+
+            // Buttons/DPad
+            uint16_t button_mask = 0;
+            if (groups.count("x360:button_a") && resolve_button(groups["x360:button_a"])) button_mask |= XINPUT_GAMEPAD_A;
+            if (groups.count("x360:button_b") && resolve_button(groups["x360:button_b"])) button_mask |= XINPUT_GAMEPAD_B;
+            if (groups.count("x360:button_x") && resolve_button(groups["x360:button_x"])) button_mask |= XINPUT_GAMEPAD_X;
+            if (groups.count("x360:button_y") && resolve_button(groups["x360:button_y"])) button_mask |= XINPUT_GAMEPAD_Y;
+            if (groups.count("x360:left_shoulder") && resolve_button(groups["x360:left_shoulder"])) button_mask |= XINPUT_GAMEPAD_LEFT_SHOULDER;
+            if (groups.count("x360:right_shoulder") && resolve_button(groups["x360:right_shoulder"])) button_mask |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
+            if (groups.count("x360:back") && resolve_button(groups["x360:back"])) button_mask |= XINPUT_GAMEPAD_BACK;
+            if (groups.count("x360:start") && resolve_button(groups["x360:start"])) button_mask |= XINPUT_GAMEPAD_START;
+            if (groups.count("x360:left_thumb") && resolve_button(groups["x360:left_thumb"])) button_mask |= XINPUT_GAMEPAD_LEFT_THUMB;
+            if (groups.count("x360:right_thumb") && resolve_button(groups["x360:right_thumb"])) button_mask |= XINPUT_GAMEPAD_RIGHT_THUMB;
+            if (groups.count("x360:dpad_up") && resolve_button(groups["x360:dpad_up"])) button_mask |= XINPUT_GAMEPAD_DPAD_UP;
+            if (groups.count("x360:dpad_down") && resolve_button(groups["x360:dpad_down"])) button_mask |= XINPUT_GAMEPAD_DPAD_DOWN;
+            if (groups.count("x360:dpad_left") && resolve_button(groups["x360:dpad_left"])) button_mask |= XINPUT_GAMEPAD_DPAD_LEFT;
+            if (groups.count("x360:dpad_right") && resolve_button(groups["x360:dpad_right"])) button_mask |= XINPUT_GAMEPAD_DPAD_RIGHT;
             rep.wButtons = button_mask;
             // Before sending the report, optionally call the inject callback with a mapped ControllerState
             if (g_inject_cb) {
@@ -368,11 +371,10 @@ void HotasMapper::publisher_thread_main(double hz) {
                        << " RX=" << rep.sThumbRX << " RY=" << rep.sThumbRY << " LT=" << (int)rep.bLeftTrigger
                        << " RT=" << (int)rep.bRightTrigger << " buttons=0x" << std::hex << rep.wButtons << std::dec;
                     std::cerr << ss.str() << "\n";
-                    mapper_log(ss.str());
                 }
                 VIGEM_ERROR err = vigem_target_x360_update(g_vigem_client, g_vigem_target, rep);
                 if (!VIGEM_SUCCESS(err)) {
-                    std::ostringstream ss; ss << "HotasMapper: vigem update failed: " << err; std::cerr << ss.str() << "\n"; mapper_log(ss.str());
+                    std::ostringstream ss; ss << "HotasMapper: vigem update failed: " << err; std::cerr << ss.str() << "\n";
                 }
             }
         }
@@ -405,26 +407,26 @@ void HotasMapper::publisher_thread_main(double hz) {
                     st.name = vk_names[vk];
                     st.press_time = now;
                     st.next_repeat = now + std::chrono::milliseconds(g_kbd_params.delay_ms);
-                    if (g_verbose_mapper) {
-                        std::ostringstream ss; ss << "HotasMapper: keydown " << st.name;
-                        std::cerr << ss.str() << "\n"; mapper_log(ss.str());
-                    }
+                        if (g_verbose_mapper) {
+                            std::ostringstream ss; ss << "HotasMapper: keydown " << st.name;
+                            std::cerr << ss.str() << "\n";
+                        }
                 } else if (want && st.pressed) {
                     if (now >= st.next_repeat) {
                         send_key(vk, true); // generate auto-repeat keydown
                         st.next_repeat = now + std::chrono::milliseconds(g_kbd_params.interval_ms);
                         if (g_verbose_mapper) {
                             std::ostringstream ss; ss << "HotasMapper: keyrepeat " << (st.name.empty()?std::to_string(vk):st.name);
-                            std::cerr << ss.str() << "\n"; mapper_log(ss.str());
+                            std::cerr << ss.str() << "\n";
                         }
                     }
                 } else if (!want && st.pressed) {
                     send_key(vk, false);
                     st.pressed = false;
-                    if (g_verbose_mapper) {
-                        std::ostringstream ss; ss << "HotasMapper: keyup " << (st.name.empty()?std::to_string(vk):st.name);
-                        std::cerr << ss.str() << "\n"; mapper_log(ss.str());
-                    }
+                        if (g_verbose_mapper) {
+                            std::ostringstream ss; ss << "HotasMapper: keyup " << (st.name.empty()?std::to_string(vk):st.name);
+                            std::cerr << ss.str() << "\n";
+                        }
                 }
             }
             // Release any keys no longer desired (not in desired_active)
@@ -440,7 +442,7 @@ void HotasMapper::publisher_thread_main(double hz) {
                     send_key(vk, false);
                     if (g_verbose_mapper) {
                         std::ostringstream ss; ss << "HotasMapper: keyup " << (it->second.name.empty()?std::to_string(vk):it->second.name);
-                        std::cerr << ss.str() << "\n"; mapper_log(ss.str());
+                        std::cerr << ss.str() << "\n";
                     }
                     it->second.pressed = false;
                 }

@@ -7,7 +7,7 @@ struct PlotConfig {
     int downsample_max = 8000;       // max points per plot after stride downsampling
     bool filter_mode = false;        // enable anomaly highlighting
     // Analog spike detection: absolute delta threshold (value jump) and z-score style optional later
-    float analog_spike_delta = 0.25f; // jump > this between consecutive samples counts as spike
+    float analog_spike_delta = 0.05f; // jump > this between consecutive samples counts as spike
     float analog_spike_return = 0.15f; // optional hysteresis when returning (future use)
     // Digital noise: very short pulses (press then release) shorter than this (seconds) considered ghost
     double digital_pulse_max = 0.005; // 5 ms default

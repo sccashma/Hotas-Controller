@@ -24,6 +24,12 @@ struct MappingEntry {
     std::string id;         // unique mapping id (e.g. "m1")
     std::string signal_id;  // e.g. "joy_x", "A", etc.
     std::string action;     // action descriptor (e.g. "x360:left_x")
+    // Conflict-resolution parameters
+    // For analog actions (axes/triggers), deadband defines inactivity range around 0
+    double deadband = 0.05; // required for analog in profile; default applied on load if missing
+    // Priority: higher number wins. For analog, highest-priority source above deadband drives output;
+    // otherwise fallback to next priority. For buttons, highest-priority active press wins.
+    int priority = 0;
 };
 
 class HotasMapper {

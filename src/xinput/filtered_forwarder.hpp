@@ -9,15 +9,7 @@
 #include <cstdlib>
 #include <fstream>
 
-// Simple logger for forwarder diagnostics
-static std::mutex _ff_log_mtx;
-static void forwarder_log(const std::string &s) {
-    std::lock_guard<std::mutex> lk(_ff_log_mtx);
-    std::ofstream out("filtered_forwarder.log", std::ios::out | std::ios::app);
-    if (!out) return;
-    out << s;
-    if (s.empty() || s.back() != '\n') out << '\n';
-}
+// Logging removed: no file loggers retained
 
 // Applies ghost filtering (short pulse suppression & analog spike suppression)
 // before sending to ViGEm.
@@ -82,7 +74,6 @@ public:
                 }
                 if (!VIGEM_SUCCESS(replug_err)) {
                     _last_update_status = format_error(replug_err);
-                    forwarder_log(std::string("Replug failed: ") + _last_update_status);
                 }
             }
             _enabled.store(e, std::memory_order_release);
@@ -99,10 +90,8 @@ public:
                 VIGEM_ERROR err = vigem_target_x360_update(_client, _target, rep);
                 if (!VIGEM_SUCCESS(err)) {
                     _last_update_status = format_error(err);
-                    forwarder_log(std::string("Warm-up update failed: ") + _last_update_status);
                 } else {
                     if(!_last_update_status.empty()) _last_update_status.clear();
-                    forwarder_log("Warm-up update sent (neutral state)");
                 }
             }
         } else {
@@ -172,8 +161,7 @@ public:
             push_btn(Signal::DPadLeft, XINPUT_GAMEPAD_DPAD_LEFT);
             push_btn(Signal::DPadRight, XINPUT_GAMEPAD_DPAD_RIGHT);
             _latest_time_filtered.store(t, std::memory_order_release);
-            static double _last_logged = 0.0;
-            if (t - _last_logged >= 0.050) { _last_logged = t; forwarder_log(std::string("FilteredForwarder: latest_time=") + std::to_string(t)); }
+            // Logging disabled
         }
 
         auto to_short = [](float v){ if (v>1) v=1; if (v<-1) v=-1; return (int16_t)(v>=0? v*32767.0f : v*32768.0f); };
@@ -241,9 +229,12 @@ private:
         }
         
         // Apply per-signal analog or digital filtering based on mode
+        // Analog: rate limiter — cap per-sample change to _analog_delta
         auto apply_analog_filter = [&](float &cur, float prev) {
-            float dv = fabsf(cur - prev);
-            if (dv >= _analog_delta) cur = prev; // spike detected; revert to prev
+            float dv = cur - prev;
+            float max_step = _analog_delta;
+            if (dv > max_step) cur = prev + max_step;
+            else if (dv < -max_step) cur = prev - max_step;
         };
         
         auto apply_digital_filter = [&](bool &now, bool prev, int btn_idx) {
@@ -342,7 +333,7 @@ private:
     std::string _last_update_status; // empty if OK
     PVIGEM_CLIENT _client = nullptr;
     PVIGEM_TARGET _target = nullptr;
-    float _analog_delta = 0.25f;
+    float _analog_delta = 0.05f;
     double _digital_max = 0.005;
     XInputPoller::ControllerState _prev{}; bool _have_prev=false;
     double _rise_time[16] = { -1.0 }; // per-button pending rise time (buttons + digital triggers)

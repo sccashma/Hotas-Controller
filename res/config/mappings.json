@@ -1,34 +1,116 @@
 {
   "mappings": [
     {
-      "action": "x360:left_x",
-      "id": "m1",
-      "signal_id": "stick:joy_x"
+      "action": "keyboard:v",
+      "deadband": 0.05,
+      "id": "m5",
+      "priority": 0,
+      "signal_id": "throttle:thumb_joy_x"
     },
     {
-      "action": "x360:left_y",
-      "id": "m2",
-      "signal_id": "stick:joy_y"
+      "action": "keyboard:v",
+      "deadband": 0.05,
+      "id": "m6",
+      "priority": 0,
+      "signal_id": "throttle:thumb_joy_y"
     },
     {
       "action": "x360:right_x",
-      "id": "m3",
+      "deadband": 0.05,
+      "id": "roll",
+      "priority": 0,
+      "signal_id": "stick:joy_x"
+    },
+    {
+      "action": "x360:right_y",
+      "deadband": 0.05,
+      "id": "pitch",
+      "priority": 0,
+      "signal_id": "stick:joy_y"
+    },
+    {
+      "action": "x360:left_x",
+      "deadband": 0.05,
+      "id": "yaw",
+      "priority": 0,
+      "signal_id": "stick:joy_z"
+    },
+    {
+      "action": "x360:left_y",
+      "deadband": 0.05,
+      "id": "throttle",
+      "priority": 0,
+      "signal_id": "throttle:right_throttle"
+    },
+    {
+      "action": "x360:right_x",
+      "deadband": 0.05,
+      "id": "freelookX",
+      "priority": 1,
       "signal_id": "throttle:thumb_joy_x"
     },
     {
       "action": "x360:right_y",
-      "id": "m4",
+      "deadband": 0.05,
+      "id": "freelookY",
+      "priority": 1,
       "signal_id": "throttle:thumb_joy_y"
     },
     {
-      "action": "keyboard:v",
-      "id": "m5",
-      "signal_id": "throttle:thumb_joy_x"
+      "action": "x360:dpad_left",
+      "deadband": 0.05,
+      "id": "flare",
+      "priority": 0,
+      "signal_id": "stick:H2_LEFT"
     },
     {
-      "action": "keyboard:v",
-      "id": "m6",
-      "signal_id": "throttle:thumb_joy_y"
+      "action": "x360:dpad_right",
+      "deadband": 0.05,
+      "id": "repair",
+      "priority": 0,
+      "signal_id": "stick:H2_RIGHT"
+    },
+    {
+      "action": "x360:left_thumb",
+      "deadband": 0.05,
+      "id": "AfterBurn",
+      "priority": 0,
+      "signal_id": "stick:E"
+    },
+    {
+      "action": "x360:left_shoulder",
+      "deadband": 0.05,
+      "id": "switch weapon",
+      "priority": 0,
+      "signal_id": "stick:B"
+    },
+    {
+      "action": "x360:left_trigger",
+      "deadband": 0.05,
+      "id": "zoom",
+      "priority": 0,
+      "signal_id": "stick:D"
+    },
+    {
+      "action": "x360:right_shoulder",
+      "deadband": 0.05,
+      "id": "rear-cam",
+      "priority": 0,
+      "signal_id": "stick:POV_DOWN"
+    },
+    {
+      "action": "x360:right_trigger",
+      "deadband": 0.05,
+      "id": "fire",
+      "priority": 0,
+      "signal_id": "stick:trigger"
+    },
+    {
+      "action": "x360:button_y",
+      "deadband": 0.05,
+      "id": "ping",
+      "priority": 0,
+      "signal_id": "throttle:H"
     }
   ]
 }

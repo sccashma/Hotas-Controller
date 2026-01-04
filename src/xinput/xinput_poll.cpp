@@ -55,11 +55,7 @@ void XInputPoller::clear() {
 }
 
 void XInputPoller::inject_state(double t, const ControllerState& state) {
-    // Debug: log injection timestamps
-    {
-        std::ofstream out("inject_state.log", std::ios::out | std::ios::app);
-        if (out) out << "inject_state: t=" << t << " lx=" << state.lx << " ly=" << state.ly << "\n";
-    }
+    // Logging removed
     // Push into rings exactly like the XInput path did
     _rings[(size_t)Signal::LeftX].push(t, state.lx);
     _rings[(size_t)Signal::LeftY].push(t, state.ly);

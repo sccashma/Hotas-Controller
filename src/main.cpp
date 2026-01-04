@@ -100,8 +100,7 @@ static void PlotHidGroup(const char* title,
 
 struct FilterSettings {
     bool enabled = false;
-    float analog_delta = 0.25f;
-    float analog_return = 0.15f;
+    float analog_delta = 0.05f;
     double digital_max_ms = 5.0; // stored in milliseconds for UI
     bool left_trigger_digital = false; // treat LT as digital for filtering
     bool right_trigger_digital = false; // treat RT as digital for filtering
@@ -153,7 +152,6 @@ static bool LoadFilterSettings(const char* path, FilterSettings& fs) {
     
     fs.enabled = getb("enabled", fs.enabled);
     fs.analog_delta = getf("analog_delta", fs.analog_delta);
-    fs.analog_return = getf("analog_return", fs.analog_return);
     fs.digital_max_ms = getd("digital_max_ms", fs.digital_max_ms);
     g_window_seconds = getd("window_seconds", g_window_seconds);
     g_virtual_output_enabled = getb("virtual_output", g_virtual_output_enabled);
@@ -181,7 +179,6 @@ static void SaveFilterSettings(const char* path, const FilterSettings& fs) {
     out << "# Filter settings\n";
     out << "enabled=" << (fs.enabled?1:0) << "\n";
     out << "analog_delta=" << fs.analog_delta << "\n";
-    out << "analog_return=" << fs.analog_return << "\n";
     out << "digital_max_ms=" << fs.digital_max_ms << "\n";
     out << "window_seconds=" << g_window_seconds << "\n";
     out << "virtual_output=" << (g_virtual_output_enabled?1:0) << "\n";
@@ -672,7 +669,9 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                         } else if (sd.id == "c_joy_x" || sd.id == "c_joy_y" || sd.id == "thumb_joy_x" || sd.id == "thumb_joy_y") {
                             v = ((double)raw / 255.0) * 2.0 - 1.0;
                         } else if (sd.id == "left_throttle" || sd.id == "right_throttle") {
-                            v = (double)raw / (double)((1ULL << sd.bits) - 1);
+                            // Treat each throttle as a joystick-like axis: normalize to -1..1
+                            double maxv = (double)((1ULL << sd.bits) - 1);
+                            v = (maxv > 0.0) ? (double)raw / maxv * 2.0 - 1.0 : 0.0;
                         } else if (sd.analog) {
                             v = (double)raw; // other analogs raw 0..(2^bits-1)
                         } else {
@@ -685,10 +684,13 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                         if (fm_it != hotas_filter_modes.end()) mode = fm_it->second;
                         double out_v = v;
                         if (mode == 2) {
-                            // Analog spike suppression
-                            double prev = prev_vals.count(map_key) ? prev_vals[map_key] : v;
-                            double dv = fabs(out_v - prev);
-                            if (dv >= working.analog_delta) out_v = prev;
+                            // Analog rate limiter: cap per-sample change to analog_delta
+                            double prev_filtered = prev_vals.count(map_key) ? prev_vals[map_key] : v;
+                            double dv = v - prev_filtered;
+                            double max_step = working.analog_delta;
+                            if (dv > max_step) out_v = prev_filtered + max_step;
+                            else if (dv < -max_step) out_v = prev_filtered - max_step;
+                            else out_v = v;
                         } else if (mode == 1) {
                             // Digital debounce/gating
                             double &rise = rise_times[map_key];
@@ -737,19 +739,59 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                         prev_vals[map_key] = out_v;
                         prev_raw_vals[map_key] = v;
                         hotas_mapper.accept_sample(map_key, out_v, now);
-                        // Store filtered value for UI plots
+                        // Store filtered value for UI plots (parent signal)
                         HidBuf &fb = g_hid_filtered_buffers[std::string(device_prefix(sd.device)) + ":" + sd.name];
                         fb.t.push_back(now);
                         fb.v.push_back(out_v);
-                        // Trim to window
-                        double window = g_window_seconds;
-                        double t0 = now - window;
-                        size_t first_keep = 0;
-                        while (first_keep < fb.t.size() && fb.t[first_keep] < t0) ++first_keep;
-                        if (first_keep > 0) {
-                            fb.t.erase(fb.t.begin(), fb.t.begin() + first_keep);
-                            fb.v.erase(fb.v.begin(), fb.v.begin() + first_keep);
+                        // Expand Digital-Multi signals into per-direction buttons and write to mapper and plots
+                        auto trim_buf = [&](HidBuf &buf) {
+                            double t0 = now - g_window_seconds;
+                            size_t first_keep = 0;
+                            while (first_keep < buf.t.size() && buf.t[first_keep] < t0) ++first_keep;
+                            if (first_keep > 0) {
+                                buf.t.erase(buf.t.begin(), buf.t.begin() + first_keep);
+                                buf.v.erase(buf.v.begin(), buf.v.begin() + first_keep);
+                            }
+                        };
+                        auto push_dir = [&](const std::string &sub_id, double dir_v) {
+                            std::string sub_key = std::string(device_prefix(sd.device)) + ":" + sub_id;
+                            hotas_mapper.accept_sample(sub_key, dir_v, now);
+                            HidBuf &sfb = g_hid_filtered_buffers[std::string(device_prefix(sd.device)) + ":" + sub_id];
+                            sfb.t.push_back(now);
+                            sfb.v.push_back(dir_v);
+                            trim_buf(sfb);
+                        };
+                        // HATs H1/H2/H3/H4: 4-bit mask: Up(0), Right(1), Down(2), Left(3)
+                        if (!sd.analog && sd.bits == 4 && (sd.id == "H1" || sd.id == "H2" || sd.id == "H3" || sd.id == "H4")) {
+                            int mask = (int)out_v;
+                            push_dir(sd.name + "_UP",   ((mask >> 0) & 1) ? 1.0 : 0.0);
+                            push_dir(sd.name + "_RIGHT",((mask >> 1) & 1) ? 1.0 : 0.0);
+                            push_dir(sd.name + "_DOWN", ((mask >> 2) & 1) ? 1.0 : 0.0);
+                            push_dir(sd.name + "_LEFT", ((mask >> 3) & 1) ? 1.0 : 0.0);
                         }
+                        // POV: 0-8 enumerated (None, Up, Up-Right, Right, Down-Right, Down, Down-Left, Left, Up-Left)
+                        if (!sd.analog && sd.bits == 4 && sd.id == "POV") {
+                            int pv = (int)out_v;
+                            bool none = (pv == 0);
+                            bool up = (pv == 1 || pv == 2 || pv == 8);
+                            bool right = (pv == 2 || pv == 3 || pv == 4);
+                            bool down = (pv == 4 || pv == 5 || pv == 6);
+                            bool left = (pv == 6 || pv == 7 || pv == 8);
+                            bool up_right = (pv == 2);
+                            bool down_right = (pv == 4);
+                            bool down_left = (pv == 6);
+                            bool up_left = (pv == 8);
+                            push_dir("POV_UP", up && !none ? 1.0 : 0.0);
+                            push_dir("POV_RIGHT", right && !none ? 1.0 : 0.0);
+                            push_dir("POV_DOWN", down && !none ? 1.0 : 0.0);
+                            push_dir("POV_LEFT", left && !none ? 1.0 : 0.0);
+                            push_dir("POV_UP_RIGHT", up_right ? 1.0 : 0.0);
+                            push_dir("POV_DOWN_RIGHT", down_right ? 1.0 : 0.0);
+                            push_dir("POV_DOWN_LEFT", down_left ? 1.0 : 0.0);
+                            push_dir("POV_UP_LEFT", up_left ? 1.0 : 0.0);
+                        }
+                        // Trim parent buffer to window
+                        trim_buf(fb);
                     }
                 } else {
                     // If no valid HOTAS data is arriving, only re-enumerate when devices appear disconnected.
@@ -980,7 +1022,6 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         // Filter settings (persistent across runs)
         bool filter_mode = working.enabled;
         float analog_delta = working.analog_delta;
-        float analog_return = working.analog_return;
         double digital_max = working.digital_max_ms;
         if (ImGui::CollapsingHeader("Filter Mode", ImGuiTreeNodeFlags_DefaultOpen)) {
             if (ImGui::Checkbox("Enable Filter Mode", &filter_mode)) {
@@ -990,8 +1031,7 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             }
             if (filter_mode) {
                 bool updated = false;
-                updated |= ImGui::SliderFloat("Analog Spike Delta", &analog_delta, 0.05f, 1.0f, "%.2f");
-                updated |= ImGui::SliderFloat("Analog Spike Return", &analog_return, 0.05f, 1.0f, "%.2f");
+                updated |= ImGui::SliderFloat("Analog Rate Limit (per sample)", &analog_delta, 0.05f, 1.0f, "%.2f");
                 double dp_min = 0.1; double dp_max = 500.0; // 0.1ms .. 500ms
                 updated |= ImGui::SliderScalar("Digital Pulse Max (ms)", ImGuiDataType_Double, &digital_max, &dp_min, &dp_max, "%.2f");
                 bool lt_dig = working.left_trigger_digital;
@@ -1008,14 +1048,13 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                 }
                 if (updated) {
                     working.analog_delta = analog_delta;
-                    working.analog_return = analog_return;
                     working.digital_max_ms = digital_max;
                     filter_dirty = true;
                     forwarder.set_params(analog_delta, digital_max/1000.0);
                 }
                 
                 ImGui::SeparatorText("HOTAS Per-Input Filter Modes");
-                ImGui::TextDisabled("Select per-signal mode: None (raw), Digital (debounce), Analog (spike suppression).");
+                ImGui::TextDisabled("Select per-signal mode: None (raw), Digital (debounce), Analog (rate limit).");
                 const char* items[] = { "None", "Digital", "Analog" };
                 if (ImGui::BeginTable("hotas_filter_modes", 2, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
                     ImGui::TableSetupColumn("Signal");
@@ -1039,7 +1078,7 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                     ImGui::EndTable();
                 }
 
-                ImGui::TextDisabled("Digital mode detects rising edges and requires sustained press; Analog mode suppresses jitter spikes.");
+                ImGui::TextDisabled("Digital mode detects rising edges and requires sustained press; Analog mode limits per-sample change for smoother analog inputs.");
                 bool runtime_dirty = (g_window_seconds != saved_window_seconds);
                 bool any_dirty = filter_dirty || runtime_dirty;
 
@@ -1190,6 +1229,32 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                 ch.display = sd.name + std::string(" (") + sd.id + ")";
                 sig_choices.push_back(std::move(ch));
             }
+            // Append virtual sub-signals for HATs and POV so users can bind per-direction inputs
+            auto append_sub = [&](const char* devp, const char* base, const char* pretty){
+                const char* dirs[][2] = { {"UP","Up"}, {"RIGHT","Right"}, {"DOWN","Down"}, {"LEFT","Left"} };
+                for (int i=0;i<4;++i) {
+                    SigChoice ch; ch.id = std::string(devp) + ":" + base + "_" + dirs[i][0];
+                    ch.display = std::string(pretty) + " " + dirs[i][1] + " (" + base + "_" + dirs[i][0] + ")";
+                    sig_choices.push_back(std::move(ch));
+                }
+            };
+            auto append_pov = [&](const char* devp){
+                const char* povs[] = {"POV_UP","POV_RIGHT","POV_DOWN","POV_LEFT","POV_UP_RIGHT","POV_DOWN_RIGHT","POV_DOWN_LEFT","POV_UP_LEFT"};
+                const char* labels[] = {"POV Up","POV Right","POV Down","POV Left","POV Up-Right","POV Down-Right","POV Down-Left","POV Up-Left"};
+                for (int i=0;i<8;++i) {
+                    SigChoice ch; ch.id = std::string(devp) + ":" + povs[i]; ch.display = std::string(labels[i]) + " (" + povs[i] + ")"; sig_choices.push_back(std::move(ch));
+                }
+            };
+            // Device filter for sub-signals
+            if (device_sel == 0 || device_sel == 1) {
+                append_sub("stick","H1","H1");
+                append_sub("stick","H2","H2");
+                append_pov("stick");
+            }
+            if (device_sel == 0 || device_sel == 2) {
+                append_sub("throttle","H3","H3");
+                append_sub("throttle","H4","H4");
+            }
             if (sig_choices.empty()) {
                 for (const auto &sd : sigs) {
                     SigChoice ch; ch.id = std::string(device_prefix(sd.device)) + ":" + sd.id; ch.display = sd.name + std::string(" (") + sd.id + ")";
@@ -1236,9 +1301,14 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             static int x360_sel = 0;
             static char keyboard_action[64] = "";
             static char mouse_action[64] = "";
+            static int form_priority = 0;
+            static double form_deadband = 0.05;
             if (action_type_sel == 0) {
                 ImGui::Combo("X360 Input", &x360_sel, x360_labels, IM_ARRAYSIZE(x360_labels));
                 ImGui::SetItemTooltip("Select the target Xbox 360 input: axes (sticks, triggers) or buttons (A/B/X/Y, shoulders, DPad, thumb presses, etc.)");
+                // Deadband applies to analog actions
+                ImGui::InputDouble("Deadband", &form_deadband, 0.01, 0.05, "%.3f");
+                ImGui::SetItemTooltip("Analog actions only: magnitude threshold below which a source is considered inactive.");
             } else if (action_type_sel == 1) {
                 // Place the picker button before the text field so it stays visible in narrow panes
                 {
@@ -1324,31 +1394,35 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                 ImGui::InputText("Mouse Action (e.g. left_click)", mouse_action, sizeof(mouse_action));
                 ImGui::SetItemTooltip("Enter a mouse action: left_click, right_click, move_up, move_down, scroll_up, scroll_down, etc.");
             }
-            if (ImGui::Button("Add Mapping")) {
+            ImGui::InputInt("Priority", &form_priority);
+            ImGui::SetItemTooltip("Higher priority wins when multiple sources map to the same output.");
+            if (ImGui::Button("Save Mapping")) {
                 MappingEntry e;
                 e.id = std::string(new_id);
                 // selected signal id
                 if (!sig_choices.empty()) e.signal_id = sig_choices[sig_sel].id; else e.signal_id = std::string("");
                 if (action_type_sel == 0) {
                     e.action = std::string(x360_actions[x360_sel]);
+                    e.deadband = form_deadband;
                 } else if (action_type_sel == 1) {
                     e.action = std::string("keyboard:") + keyboard_action;
                 } else {
                     e.action = std::string("mouse:") + mouse_action;
                 }
-                if (!hotas_mapper.add_mapping(e)) {
-                    ImGui::TextColored(ImVec4(1,0.2f,0.2f,1), "Add failed: id exists");
-                }
+                e.priority = form_priority;
+                hotas_mapper.add_mapping(e); // overwrites if id exists
             }
             ImGui::SetItemTooltip("Create a new mapping from the HOTAS signal to the selected action. The Mapping ID must be unique.");
             ImGui::Separator();
 
             // Show table of mappings
             auto entries = hotas_mapper.list_mapping_entries();
-            if (ImGui::BeginTable("mappings_table", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders)) {
+            if (ImGui::BeginTable("mappings_table", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_SizingStretchSame)) {
                 ImGui::TableSetupColumn("ID");
                 ImGui::TableSetupColumn("Signal");
                 ImGui::TableSetupColumn("Action");
+                ImGui::TableSetupColumn("Priority");
+                ImGui::TableSetupColumn("Deadband");
                 ImGui::TableHeadersRow();
                 for (size_t i = 0; i < entries.size(); ++i) {
                     const auto &me = entries[i];
@@ -1356,11 +1430,95 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                     ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(me.id.c_str());
                     ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(me.signal_id.c_str());
                     ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(me.action.c_str());
+                    ImGui::TableSetColumnIndex(3); ImGui::Text("%d", me.priority);
+                    ImGui::TableSetColumnIndex(4);
+                    if (me.action.rfind("x360:",0) == 0) ImGui::Text("%.3f", me.deadband); else ImGui::TextDisabled("n/a");
                     // Remove button per row
                     ImGui::TableNextRow();
                     ImGui::TableSetColumnIndex(0);
                     if (ImGui::SmallButton((std::string("Remove##") + me.id).c_str())) {
                         hotas_mapper.remove_mapping(me.id);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton((std::string("Edit##") + me.id).c_str())) {
+                        // Prefill form with this entry
+                        strncpy(new_id, me.id.c_str(), sizeof(new_id)-1); new_id[sizeof(new_id)-1] = '\0';
+                        // signal id device prefix -> device selector and list index
+                        int dev_for_sig = 0; // 1=Stick,2=Throttle
+                        std::string sid = me.signal_id;
+                        std::string base_id = sid;
+                        if (sid.rfind("stick:",0) == 0) { dev_for_sig = 1; base_id = sid.substr(6); }
+                        else if (sid.rfind("throttle:",0) == 0) { dev_for_sig = 2; base_id = sid.substr(9); }
+                        device_sel = dev_for_sig;
+                        // rebuild choices (including sub-signals) and pick matching
+                        sig_choices.clear(); sig_items.clear();
+                        auto sigs2 = hotas.list_signals();
+                        for (const auto &sd : sigs2) {
+                            bool include = (device_sel == 0) ||
+                                           (device_sel == 1 && sd.device == HotasReader::SignalDescriptor::DeviceKind::Stick) ||
+                                           (device_sel == 2 && sd.device == HotasReader::SignalDescriptor::DeviceKind::Throttle);
+                            if (!include) continue;
+                            SigChoice ch; ch.id = std::string(device_prefix(sd.device)) + ":" + sd.id; ch.display = sd.name + std::string(" (") + sd.id + ")";
+                            if (sd.id == base_id) sig_sel = (int)sig_choices.size();
+                            sig_choices.push_back(std::move(ch));
+                        }
+                        // Append sub-signals for selection
+                        if (device_sel == 0 || device_sel == 1) {
+                            auto add_and_match = [&](const std::string &id, const std::string &disp){ SigChoice ch{ id, disp }; if (sid == id) sig_sel = (int)sig_choices.size(); sig_choices.push_back(std::move(ch)); };
+                            add_and_match("stick:H1_UP","H1 Up (H1_UP)");
+                            add_and_match("stick:H1_RIGHT","H1 Right (H1_RIGHT)");
+                            add_and_match("stick:H1_DOWN","H1 Down (H1_DOWN)");
+                            add_and_match("stick:H1_LEFT","H1 Left (H1_LEFT)");
+                            add_and_match("stick:H2_UP","H2 Up (H2_UP)");
+                            add_and_match("stick:H2_RIGHT","H2 Right (H2_RIGHT)");
+                            add_and_match("stick:H2_DOWN","H2 Down (H2_DOWN)");
+                            add_and_match("stick:H2_LEFT","H2 Left (H2_LEFT)");
+                            add_and_match("stick:POV_UP","POV Up (POV_UP)");
+                            add_and_match("stick:POV_RIGHT","POV Right (POV_RIGHT)");
+                            add_and_match("stick:POV_DOWN","POV Down (POV_DOWN)");
+                            add_and_match("stick:POV_LEFT","POV Left (POV_LEFT)");
+                            add_and_match("stick:POV_UP_RIGHT","POV Up-Right (POV_UP_RIGHT)");
+                            add_and_match("stick:POV_DOWN_RIGHT","POV Down-Right (POV_DOWN_RIGHT)");
+                            add_and_match("stick:POV_DOWN_LEFT","POV Down-Left (POV_DOWN_LEFT)");
+                            add_and_match("stick:POV_UP_LEFT","POV Up-Left (POV_UP_LEFT)");
+                        }
+                        if (device_sel == 0 || device_sel == 2) {
+                            auto add_and_match = [&](const std::string &id, const std::string &disp){ SigChoice ch{ id, disp }; if (sid == id) sig_sel = (int)sig_choices.size(); sig_choices.push_back(std::move(ch)); };
+                            add_and_match("throttle:H3_UP","H3 Up (H3_UP)");
+                            add_and_match("throttle:H3_RIGHT","H3 Right (H3_RIGHT)");
+                            add_and_match("throttle:H3_DOWN","H3 Down (H3_DOWN)");
+                            add_and_match("throttle:H3_LEFT","H3 Left (H3_LEFT)");
+                            add_and_match("throttle:H4_UP","H4 Up (H4_UP)");
+                            add_and_match("throttle:H4_RIGHT","H4 Right (H4_RIGHT)");
+                            add_and_match("throttle:H4_DOWN","H4 Down (H4_DOWN)");
+                            add_and_match("throttle:H4_LEFT","H4 Left (H4_LEFT)");
+                        }
+                        sig_items.clear(); sig_items.reserve(sig_choices.size());
+                        for (auto &ch : sig_choices) sig_items.push_back(ch.display.c_str());
+                        // action type and specifics
+                        if (me.action.rfind("x360:",0) == 0) {
+                            action_type_sel = 0;
+                            std::string a = me.action.substr(5);
+                            int found = 0;
+                            for (int idx=0; idx<IM_ARRAYSIZE(x360_actions); ++idx) {
+                                if (a == std::string(x360_actions[idx]).substr(5)) { found = idx; break; }
+                            }
+                            // Simpler: match entire string
+                            for (int idx=0; idx<IM_ARRAYSIZE(x360_actions); ++idx) {
+                                if (me.action == std::string(x360_actions[idx])) { found = idx; break; }
+                            }
+                            x360_sel = found;
+                            form_deadband = me.deadband;
+                        } else if (me.action.rfind("keyboard:",0) == 0) {
+                            action_type_sel = 1;
+                            strncpy(keyboard_action, me.action.substr(9).c_str(), sizeof(keyboard_action)-1);
+                            keyboard_action[sizeof(keyboard_action)-1] = '\0';
+                        } else if (me.action.rfind("mouse:",0) == 0) {
+                            action_type_sel = 2;
+                            strncpy(mouse_action, me.action.substr(6).c_str(), sizeof(mouse_action)-1);
+                            mouse_action[sizeof(mouse_action)-1] = '\0';
+                        }
+                        form_priority = me.priority;
                     }
                 }
                 ImGui::EndTable();
@@ -1453,9 +1611,10 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                         plotted = ((double)val / 255.0) * 2.0 - 1.0;
                         y_min = -1.0; y_max = 1.0;
                     } else if (mid == "left_throttle" || mid == "right_throttle") {
-                        // 10-bit throttle -> 0..1
-                        plotted = (double)val / (double)((1ULL << m.bits) - 1);
-                        y_min = 0.0; y_max = 1.0;
+                        // 10-bit throttle -> treat as joystick axis: -1..1
+                        double maxv = (double)((1ULL << m.bits) - 1);
+                        plotted = (maxv > 0.0) ? (double)val / maxv * 2.0 - 1.0 : 0.0;
+                        y_min = -1.0; y_max = 1.0;
                     } else if (m.analog) {
                         // Other analogs: plot raw 0..(2^bits-1)
                         y_min = 0.0; y_max = (double)((1ULL << m.bits) - 1);
@@ -1504,7 +1663,7 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                 double window = g_window_seconds;
                 double latest = hotas.latest_time();
                 double t0 = latest - window;
-                PlotHidGroup("Throttle", g_hid_buffers, { {"throttle:LEFT_THROTTLE","Left"}, {"throttle:RIGHT_THROTTLE","Right"} }, window, t0, 0.0f, 1.0f);
+                PlotHidGroup("Throttle", g_hid_buffers, { {"throttle:LEFT_THROTTLE","Left"}, {"throttle:RIGHT_THROTTLE","Right"} }, window, t0, -1.0f, 1.0f);
                 // Throttle Thumb Joystick: THUMB_JOY_X/Y (-1..1)
                 PlotHidGroup("Thumb Joystick", g_hid_buffers, { {"throttle:THUMB_JOY_X","x"}, {"throttle:THUMB_JOY_Y","y"} }, window, t0, -1.0f, 1.0f);
                 // Throttle Wheels/RTY (0..255)
@@ -1656,10 +1815,17 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             PlotHidGroup("C-Joy (filtered)", g_hid_filtered_buffers, { {"stick:C_JOY_X","x"}, {"stick:C_JOY_Y","y"} }, window, t0, -1.0f, 1.0f);
             PlotHidGroup("Triggers (filtered)", g_hid_filtered_buffers, { {"stick:TRIGGER","Trigger"}, {"stick:E","pinky trigger"} }, window, t0, 0.0f, 1.0f);
             PlotHidGroup("Buttons (filtered)", g_hid_filtered_buffers, { {"stick:A","A"}, {"stick:B","B"}, {"stick:C","C"}, {"stick:D","D"} }, window, t0, 0.0f, 1.0f);
-            PlotHidGroup("POV (filtered)", g_hid_filtered_buffers, { {"stick:POV","POV"} }, window, t0, 0.0f, 15.0f);
-            PlotHidGroup("H1 (filtered)", g_hid_filtered_buffers, { {"stick:H1","H1"} }, window, t0, 0.0f, 15.0f);
-            PlotHidGroup("H2 (filtered)", g_hid_filtered_buffers, { {"stick:H2","H2"} }, window, t0, 0.0f, 15.0f);
-            PlotHidGroup("Throttle (filtered)", g_hid_filtered_buffers, { {"throttle:LEFT_THROTTLE","Left"}, {"throttle:RIGHT_THROTTLE","Right"} }, window, t0, 0.0f, 1.0f);
+            PlotHidGroup("POV (filtered)", g_hid_filtered_buffers, {
+                {"stick:POV_UP","Up"}, {"stick:POV_RIGHT","Right"}, {"stick:POV_DOWN","Down"}, {"stick:POV_LEFT","Left"},
+                {"stick:POV_UP_RIGHT","Up-Right"}, {"stick:POV_DOWN_RIGHT","Down-Right"}, {"stick:POV_DOWN_LEFT","Down-Left"}, {"stick:POV_UP_LEFT","Up-Left"}
+            }, window, t0, 0.0f, 1.0f);
+            PlotHidGroup("H1 (filtered)", g_hid_filtered_buffers, {
+                {"stick:H1_UP","Up"}, {"stick:H1_RIGHT","Right"}, {"stick:H1_DOWN","Down"}, {"stick:H1_LEFT","Left"}
+            }, window, t0, 0.0f, 1.0f);
+            PlotHidGroup("H2 (filtered)", g_hid_filtered_buffers, {
+                {"stick:H2_UP","Up"}, {"stick:H2_RIGHT","Right"}, {"stick:H2_DOWN","Down"}, {"stick:H2_LEFT","Left"}
+            }, window, t0, 0.0f, 1.0f);
+            PlotHidGroup("Throttle (filtered)", g_hid_filtered_buffers, { {"throttle:LEFT_THROTTLE","Left"}, {"throttle:RIGHT_THROTTLE","Right"} }, window, t0, -1.0f, 1.0f);
             PlotHidGroup("Thumb Joystick (filtered)", g_hid_filtered_buffers, { {"throttle:THUMB_JOY_X","x"}, {"throttle:THUMB_JOY_Y","y"} }, window, t0, -1.0f, 1.0f);
             PlotHidGroup("Wheels (filtered)", g_hid_filtered_buffers, { {"throttle:F_WHEEL","F"}, {"throttle:G_WHEEL","G"} }, window, t0, 0.0f, 255.0f);
             PlotHidGroup("Rotaries (filtered)", g_hid_filtered_buffers, { {"throttle:RTY3","RTY3"}, {"throttle:RTY4","RTY4"} }, window, t0, 0.0f, 255.0f);
@@ -1677,7 +1843,12 @@ int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                 {"throttle:SW1","SW1"}, {"throttle:SW2","SW2"}, {"throttle:SW3","SW3"}, {"throttle:SW4","SW4"}, {"throttle:SW5","SW5"}, {"throttle:SW6","SW6"}
             }, window, t0, 0.0f, 1.0f);
             PlotHidGroup("Mode Buttons (filtered)", g_hid_filtered_buffers, { {"throttle:M1","M1"}, {"throttle:M2","M2"}, {"throttle:S1","S1"} }, window, t0, 0.0f, 1.0f);
-            PlotHidGroup("H3/H4 (filtered)", g_hid_filtered_buffers, { {"throttle:H3","H3"}, {"throttle:H4","H4"} }, window, t0, 0.0f, 15.0f);
+            PlotHidGroup("H3 (filtered)", g_hid_filtered_buffers, {
+                {"throttle:H3_UP","Up"}, {"throttle:H3_RIGHT","Right"}, {"throttle:H3_DOWN","Down"}, {"throttle:H3_LEFT","Left"}
+            }, window, t0, 0.0f, 1.0f);
+            PlotHidGroup("H4 (filtered)", g_hid_filtered_buffers, {
+                {"throttle:H4_UP","Up"}, {"throttle:H4_RIGHT","Right"}, {"throttle:H4_DOWN","Down"}, {"throttle:H4_LEFT","Left"}
+            }, window, t0, 0.0f, 1.0f);
         }
         ImGui::End();
 
